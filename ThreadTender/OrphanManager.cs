@@ -40,13 +40,13 @@ public class OrphanManager(BotConfig config, Database db, Transposer transposer,
 		if (db.GetTransposedThread(message.Id) is not null)
 			return;
 
-		MovableContent content = await MovableContent.CaptureAsync(message, PendingDir(message.Id), config.MaxAttachmentBytes,
+		MovableContent content = await MovableContent.CaptureAsync(message, PendingDir(message.Id), config.MaxAttachmentBytes(message.Channel!.GuildId ?? 0),
 			author.Id, author.NameOverride, contentOverride);
 
 		// Persist BEFORE deleting — from here on, the content can always be recovered.
 		PendingOrphan pending = new(message.Id, message.ChannelId, message.Channel!.Guild.Id, author.Id,
 			content.Content, content.Notes, author.NameOverride ?? "", 0,
-			DateTimeOffset.UtcNow.AddMinutes(config.OrphanTimeoutMinutes));
+			DateTimeOffset.UtcNow.AddMinutes(config.OrphanTimeoutMinutes(message.Channel!.GuildId ?? 0)));
 		db.UpsertPending(pending);
 
 		try
@@ -85,7 +85,7 @@ public class OrphanManager(BotConfig config, Database db, Transposer transposer,
 			.WithContent(
 				$"{AddresseeFor(pending)} — this channel keeps discussion attached to posts, so I've set your message aside for a moment. " +
 				$"**Which post were you replying to?** Pick one below, or give me a message ID / a snippet of its text. " +
-				$"You have {config.OrphanTimeoutMinutes} minutes; after that I'll DM your text back to you so nothing is lost.");
+				$"You have {config.OrphanTimeoutMinutes(pending.GuildId)} minutes; after that I'll DM your text back to you so nothing is lost.");
 		if (pending.AuthorName.Length == 0)
 			prompt.WithAllowedMentions([new UserMention(pending.AuthorId)]);
 
@@ -133,7 +133,7 @@ public class OrphanManager(BotConfig config, Database db, Transposer transposer,
 
 		// Debug users may drive any prompt: masqueraded orphans belong to identities
 		// that can't click buttons themselves.
-		if (e.User.Id != pending.AuthorId && !config.IsDebugUser(e.User.Id))
+		if (e.User.Id != pending.AuthorId && !config.IsDebugUser(pending.GuildId, e.User.Id))
 		{
 			await RespondEphemeralAsync(e.Interaction, "This prompt belongs to someone else's message.");
 			return;
@@ -217,11 +217,11 @@ public class OrphanManager(BotConfig config, Database db, Transposer transposer,
 		}
 
 		// Text path: fuzzy-match against recent top-level posts.
-		List<DiscordMessage> posts = await GetRecentTopLevelPostsAsync(channel, config.SearchDepth);
+		List<DiscordMessage> posts = await GetRecentTopLevelPostsAsync(channel, config.SearchDepth(pending.GuildId));
 		List<(DiscordMessage Message, int Score)> matches = posts
 			.Where(p => !string.IsNullOrWhiteSpace(p.Content))
 			.Select(p => (Message: p, Score: Fuzz.PartialRatio(query.ToLowerInvariant(), p.Content!.ToLowerInvariant())))
-			.Where(m => m.Score >= config.FuzzyThreshold)
+			.Where(m => m.Score >= config.FuzzyThreshold(pending.GuildId))
 			.OrderByDescending(m => m.Score)
 			.Take(5)
 			.ToList();
@@ -310,7 +310,10 @@ public class OrphanManager(BotConfig config, Database db, Transposer transposer,
 
 				case ChannelMode.ReplyOnly:
 				{
-					await transposer.RepostToChannelAsync(client, channel, RehydrateContent(pending), pending.MessageId, target);
+					// In-channel pseudo-replies stand in for the comment the user meant to
+					// write, so they impersonate via webhook; the bot relay is reserved for
+					// post-thread transpositions.
+					await transposer.RepostToChannelAsync(client, channel, RehydrateContent(pending), pending.MessageId, target, RepostStyle.Webhook);
 					await CleanupAsync(client, pending, deletePrompt: true);
 					await DismissAsync(interaction, editOriginal);
 					break;
@@ -329,7 +332,7 @@ public class OrphanManager(BotConfig config, Database db, Transposer transposer,
 						break;
 					}
 
-					ulong repostId = await transposer.RepostToChannelAsync(client, channel, RehydrateContent(pending), pending.MessageId, target);
+					ulong repostId = await transposer.RepostToChannelAsync(client, channel, RehydrateContent(pending), pending.MessageId, target, RepostStyle.Webhook);
 					await CleanupAsync(client, pending, deletePrompt: true);
 					await DismissAsync(interaction, editOriginal);
 
@@ -481,7 +484,7 @@ public class OrphanManager(BotConfig config, Database db, Transposer transposer,
 			if (!delivered)
 			{
 				// Never destroy content we failed to return: re-arm and retry later.
-				pending = pending with { ExpiresAt = DateTimeOffset.UtcNow.AddMinutes(config.OrphanTimeoutMinutes) };
+				pending = pending with { ExpiresAt = DateTimeOffset.UtcNow.AddMinutes(config.OrphanTimeoutMinutes(pending.GuildId)) };
 				db.UpsertPending(pending);
 				if (timeouts.TryRemove(pending.MessageId, out CancellationTokenSource? stale))
 				{
@@ -574,7 +577,7 @@ public class OrphanManager(BotConfig config, Database db, Transposer transposer,
 	private async Task<List<DiscordMessage>> GetRecentTopLevelPostsAsync(DiscordChannel channel, int take)
 	{
 		List<DiscordMessage> result = [];
-		await foreach (DiscordMessage message in channel.GetMessagesAsync(config.SearchDepth))
+		await foreach (DiscordMessage message in channel.GetMessagesAsync(config.SearchDepth(channel.GuildId ?? 0)))
 		{
 			if (message.MessageType != DiscordMessageType.Default)
 				continue;

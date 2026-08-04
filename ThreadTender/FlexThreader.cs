@@ -90,7 +90,7 @@ public class FlexThreader(BotConfig config, Database db, Transposer transposer, 
 			return 0;
 
 		List<DiscordMessage> replies = [];
-		await foreach (DiscordMessage message in channel.GetMessagesAsync(config.SearchDepth))
+		await foreach (DiscordMessage message in channel.GetMessagesAsync(config.SearchDepth(channel.GuildId ?? 0)))
 		{
 			if (message.MessageType != DiscordMessageType.Reply)
 				continue;
@@ -163,6 +163,13 @@ public class FlexThreader(BotConfig config, Database db, Transposer transposer, 
 
 		List<GraphEdge> edges = db.GetGraphEdges(root.Id); // oldest → newest
 		List<(ulong Id, string? Name)> movedAuthors = [];
+
+		// Original message ID → its copy in the thread, built as the sweep walks oldest
+		// first (so a reply's parent is always copied before the reply itself). Used to
+		// recreate reply chains: webhooks can't set real reply references, so a copy
+		// whose parent also moved gets a link header pointing at the parent's copy.
+		Dictionary<ulong, DiscordMessage> copies = [];
+
 		foreach (GraphEdge edge in edges)
 		{
 			// An edge whose message already has a transposed copy (a crash landed between
@@ -198,11 +205,11 @@ public class FlexThreader(BotConfig config, Database db, Transposer transposer, 
 			// belong in the swept copy — the repost re-adds its own presentation.
 			string? contentOverride = Transposer.StripReplyHeader(message.Content);
 			contentOverride = Transposer.StripAuthorTag(contentOverride, edge.AuthorId, edge.AuthorName);
-			if (message.Author is not null && config.IsDebugUser(message.Author.Id))
+			if (message.Author is not null && config.IsDebugUser(channel.GuildId ?? 0, message.Author.Id))
 				contentOverride = Masquerade.StripPrefix(contentOverride);
 
 			string tempDir = Path.Combine(dataDir, "temp", edge.MessageId.ToString());
-			MovableContent content = await MovableContent.CaptureAsync(message, tempDir, config.MaxAttachmentBytes,
+			MovableContent content = await MovableContent.CaptureAsync(message, tempDir, config.MaxAttachmentBytes(channel.GuildId ?? 0),
 				edge.AuthorId, edge.AuthorName.Length > 0 ? edge.AuthorName : null,
 				contentOverride);
 			try
@@ -210,20 +217,43 @@ public class FlexThreader(BotConfig config, Database db, Transposer transposer, 
 				// Same invariant as everywhere else: repost first, delete only once the
 				// copy exists. A crash mid-sweep leaves the mapping unset, so the next
 				// comment's RecordCommentAsync re-runs the sweep and moves the remainder.
+				// Reply linkage: a real reply carries a reference; a pseudo-reply carries
+				// its target in the header line (parsed from the RAW content, before the
+				// header is stripped above). Links to the root itself are omitted —
+				// sequential flow in the thread already implies them.
+				ulong? parentId = Transposer.ParseReplyHeaderTarget(message.Content) ?? message.Reference?.Message?.Id;
+				string? replyHeader = parentId is { } pid && pid != root.Id && copies.TryGetValue(pid, out DiscordMessage? parentCopy)
+					? Transposer.ReplyHeaderFor(parentCopy)
+					: null;
+
 				// The sweep re-presents a conversation that already happened, so webhook
 				// impersonation keeps it reading naturally; live transpositions elsewhere
 				// use the bot relay instead.
-				DiscordMessage copy = await transposer.RepostAsync(client, thread, content, edge.MessageId, RepostStyle.Webhook);
+				DiscordMessage copy = await transposer.RepostAsync(client, thread, content, edge.MessageId, RepostStyle.Webhook, replyHeader);
+				copies[edge.MessageId] = copy;
 
 				// Reactions can't be transposed, but the bot can echo each emoji on the
-				// copy — an invitation for people to re-react. Decoration only: an emoji
-				// the bot can't use (external server) is silently skipped.
+				// copy — an invitation for people to re-react. Decoration only: a failed
+				// echo never aborts the sweep, but it IS logged (reaction rate limits are
+				// a special, easily-fumbled bucket) rather than swallowed silently.
 				if (message.Reactions is { Count: > 0 })
 				{
+					Console.WriteLine(
+						$"[ThreadTender] Echoing {message.Reactions.Count} reaction(s) from {edge.MessageId}: " +
+						string.Join(" ", message.Reactions.Select(r => r.Emoji.ToString())));
 					foreach (DiscordReaction reaction in message.Reactions)
 					{
-						try { await copy.CreateReactionAsync(reaction.Emoji); }
-						catch (Exception) { }
+						try
+						{
+							await copy.CreateReactionAsync(reaction.Emoji);
+						}
+						catch (Exception ex)
+						{
+							Console.WriteLine($"[ThreadTender] Reaction echo {reaction.Emoji} failed on copy {copy.Id}: {ex.GetType().Name}: {ex.Message}");
+						}
+						// Discord's reaction rate limit is ~1 per 300ms per channel and uses
+						// its own bucket; explicit spacing keeps echoes from tripping 429s.
+						await Task.Delay(325);
 					}
 				}
 

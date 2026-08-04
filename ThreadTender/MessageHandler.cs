@@ -201,7 +201,7 @@ public class MessageHandler(BotConfig config, Database db, Transposer transposer
 			return;
 
 		string tempDir = Path.Combine(dataDir, "temp", message.Id.ToString());
-		MovableContent content = await MovableContent.CaptureAsync(message, tempDir, config.MaxAttachmentBytes,
+		MovableContent content = await MovableContent.CaptureAsync(message, tempDir, config.MaxAttachmentBytes(message.Channel!.GuildId ?? 0),
 			author.Id, author.NameOverride, contentOverride);
 		try
 		{

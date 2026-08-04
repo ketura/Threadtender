@@ -52,10 +52,10 @@ public static class ChannelModes
 
 /// <summary>
 /// How a repost is presented. Not configured per binding — the CONTEXT picks: the flex
-/// sweep re-presents an existing conversation and uses webhook impersonation so it
-/// reads naturally; every live transposition (a reply moved after its thread exists, an
-/// orphan resolution) is the bot acting on someone's message right now, and posts
-/// honestly as the bot with an "@user:" header.
+/// sweep and in-channel pseudo-replies re-present a comment where it should have been,
+/// and use webhook impersonation so the channel reads naturally; a transposition into
+/// an already-existing thread is the bot acting on someone's message right now, and
+/// posts honestly as the bot with an "@user:" header.
 /// </summary>
 public enum RepostStyle
 {
@@ -88,32 +88,34 @@ public class BotConfig
 
 	public string Token { get; private set; } = "";
 
-	// ------------------------------------------------------------ global knobs
-	// DB-backed with code defaults; cached, cache updated on mutation.
+	// ------------------------------------------------------------ per-guild knobs
+	// DB-backed with code defaults; cached, cache updated on mutation. Everything is
+	// scoped to a guild — two servers sharing this bot never see each other's settings.
 
-	public int OrphanTimeoutMinutes => GetInt("orphan_timeout_minutes", 15);
-	public int ThreadNameMaxLength => GetInt("thread_name_max_length", 80);
-	public long MaxAttachmentBytes => GetLong("max_attachment_bytes", 25 * 1024 * 1024);
-	public int SearchDepth => GetInt("search_depth", 100);
-	public int FuzzyThreshold => GetInt("fuzzy_threshold", 70);
+	public int OrphanTimeoutMinutes(ulong guildId) => GetInt(guildId, "orphan_timeout_minutes", 15);
+	public int ThreadNameMaxLength(ulong guildId) => GetInt(guildId, "thread_name_max_length", 80);
+	public long MaxAttachmentBytes(ulong guildId) => GetLong(guildId, "max_attachment_bytes", 25 * 1024 * 1024);
+	public int SearchDepth(ulong guildId) => GetInt(guildId, "search_depth", 100);
+	public int FuzzyThreshold(ulong guildId) => GetInt(guildId, "fuzzy_threshold", 70);
 
-	public IReadOnlyList<ulong> DebugImpersonationUserIds =>
-		(GetString("debug_impersonation_user_ids") ?? "")
+	public IReadOnlyList<ulong> DebugImpersonationUserIds(ulong guildId) =>
+		(GetString(guildId, "debug_impersonation_user_ids") ?? "")
 			.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
 			.Select(ulong.Parse).ToList();
 
-	private string? GetString(string key) => settingsCache.GetOrAdd(key, k => db.GetSetting(k));
-	private int GetInt(string key, int fallback) => int.TryParse(GetString(key), out int v) ? v : fallback;
-	private long GetLong(string key, long fallback) => long.TryParse(GetString(key), out long v) ? v : fallback;
+	private string? GetString(ulong guildId, string key) =>
+		settingsCache.GetOrAdd($"{guildId}:{key}", _ => db.GetGuildSetting(guildId, key));
+	private int GetInt(ulong guildId, string key, int fallback) => int.TryParse(GetString(guildId, key), out int v) ? v : fallback;
+	private long GetLong(ulong guildId, string key, long fallback) => long.TryParse(GetString(guildId, key), out long v) ? v : fallback;
 
-	public void SetGlobal(string key, string value)
+	public void SetGlobal(ulong guildId, string key, string value)
 	{
-		db.SetSetting(key, value);
-		settingsCache[key] = value;
+		db.SetGuildSetting(guildId, key, value);
+		settingsCache[$"{guildId}:{key}"] = value;
 	}
 
-	public void SetDebugUsers(IEnumerable<ulong> userIds) =>
-		SetGlobal("debug_impersonation_user_ids", string.Join(",", userIds));
+	public void SetDebugUsers(ulong guildId, IEnumerable<ulong> userIds) =>
+		SetGlobal(guildId, "debug_impersonation_user_ids", string.Join(",", userIds));
 
 	// ------------------------------------------------------------ bindings
 
@@ -139,7 +141,7 @@ public class BotConfig
 	public bool IsWhitelisted(ulong channelId, ulong userId) =>
 		GetBinding(channelId)?.Whitelist.Contains(userId) == true;
 
-	public bool IsDebugUser(ulong userId) => DebugImpersonationUserIds.Contains(userId);
+	public bool IsDebugUser(ulong guildId, ulong userId) => DebugImpersonationUserIds(guildId).Contains(userId);
 
 	// ------------------------------------------------------------ loading
 

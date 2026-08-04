@@ -28,7 +28,7 @@ public static partial class Masquerade
 	public static async Task<(EffectiveAuthor Author, string? ContentOverride)> ResolveAsync(BotConfig config, DiscordMessage message)
 	{
 		EffectiveAuthor real = new(message.Author!.Id, null);
-		if (!config.IsDebugUser(message.Author.Id))
+		if (!config.IsDebugUser(message.Channel!.GuildId ?? 0, message.Author.Id))
 			return (real, null);
 
 		Match match = PrefixRegex().Match(message.Content ?? "");

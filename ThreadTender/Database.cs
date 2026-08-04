@@ -70,9 +70,11 @@ public class Database : IDisposable
 				flex_threshold INTEGER NOT NULL DEFAULT 5,
 				flex_line_threshold INTEGER NOT NULL DEFAULT 0
 			);
-			CREATE TABLE IF NOT EXISTS settings (
-				key TEXT PRIMARY KEY,
-				value TEXT NOT NULL
+			CREATE TABLE IF NOT EXISTS guild_settings (
+				guild_id INTEGER NOT NULL,
+				key TEXT NOT NULL,
+				value TEXT NOT NULL,
+				PRIMARY KEY (guild_id, key)
 			);
 			""");
 
@@ -290,18 +292,24 @@ public class Database : IDisposable
 	public void DeleteGraphEdgesForChannel(ulong channelId) =>
 		Execute("DELETE FROM graph_edges WHERE channel_id = $cid", ("$cid", (long)channelId));
 
-	// ---------------------------------------------------------------- settings
+	// ---------------------------------------------------------------- settings (per guild)
+	// (A legacy global `settings` table may exist in DBs from early builds; it is
+	// ignored — bot settings are per-guild now.)
 
-	public void SetSetting(string key, string value) => Execute(
-		"INSERT INTO settings (key, value) VALUES ($k, $v) ON CONFLICT(key) DO UPDATE SET value = $v",
-		("$k", key), ("$v", value));
+	public void SetGuildSetting(ulong guildId, string key, string value) => Execute(
+		"""
+		INSERT INTO guild_settings (guild_id, key, value) VALUES ($g, $k, $v)
+		ON CONFLICT(guild_id, key) DO UPDATE SET value = $v
+		""",
+		("$g", (long)guildId), ("$k", key), ("$v", value));
 
-	public string? GetSetting(string key)
+	public string? GetGuildSetting(ulong guildId, string key)
 	{
 		lock (gate)
 		{
 			using SqliteCommand cmd = connection.CreateCommand();
-			cmd.CommandText = "SELECT value FROM settings WHERE key = $k";
+			cmd.CommandText = "SELECT value FROM guild_settings WHERE guild_id = $g AND key = $k";
+			cmd.Parameters.AddWithValue("$g", (long)guildId);
 			cmd.Parameters.AddWithValue("$k", key);
 			return cmd.ExecuteScalar() as string;
 		}

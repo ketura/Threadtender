@@ -19,19 +19,22 @@ public class SetupCommands(BotConfig config, Database db, OrphanManager orphans,
 
 	public async Task RegisterAsync(DiscordClient client)
 	{
+		// Per-guild registration: instant availability, unlike global commands.
+		foreach (DiscordGuild guild in client.Guilds.Values)
+			await RegisterGuildAsync(guild);
+	}
+
+	/// <summary>Registers the setup commands in one guild — also invoked live when the bot joins a new server.</summary>
+	public async Task RegisterGuildAsync(DiscordGuild guild)
+	{
 		DiscordApplicationCommand[] commands =
 		[
 			Command("bind", "Set up ThreadTender on a channel, or edit an existing binding."),
 			Command("unbind", "Remove ThreadTender from a channel."),
-			Command("botsettings", "View and edit global ThreadTender settings."),
+			Command("botsettings", "View and edit ThreadTender settings for this server."),
 		];
-
-		// Per-guild registration: instant availability, unlike global commands.
-		foreach (DiscordGuild guild in client.Guilds.Values)
-		{
-			await guild.BulkOverwriteApplicationCommandsAsync(commands);
-			Console.WriteLine($"[ThreadTender] Registered setup commands in \"{guild.Name}\" ({guild.Id}).");
-		}
+		await guild.BulkOverwriteApplicationCommandsAsync(commands);
+		Console.WriteLine($"[ThreadTender] Registered setup commands in \"{guild.Name}\" ({guild.Id}).");
 	}
 
 	private static DiscordApplicationCommand Command(string name, string description) =>
@@ -61,7 +64,7 @@ public class SetupCommands(BotConfig config, Database db, OrphanManager orphans,
 				break;
 
 			case "botsettings":
-				await RespondAsync(interaction, BuildGlobalsMenu());
+				await RespondAsync(interaction, BuildGlobalsMenu(interaction.Guild!.Id));
 				break;
 		}
 	}
@@ -146,8 +149,8 @@ public class SetupCommands(BotConfig config, Database db, OrphanManager orphans,
 
 		if (parts is ["ttg", "mod", var key])
 		{
-			string? error = TrySetGlobal(key, value);
-			await UpdateAsync(e.Interaction, error is null ? BuildGlobalsMenu() : Ending(error));
+			string? error = TrySetGlobal(e.Interaction.Guild!.Id, key, value);
+			await UpdateAsync(e.Interaction, error is null ? BuildGlobalsMenu(e.Interaction.Guild!.Id) : Ending(error));
 		}
 	}
 
@@ -390,18 +393,18 @@ public class SetupCommands(BotConfig config, Database db, OrphanManager orphans,
 		("fuzzy_threshold", "Fuzzy threshold", "Minimum match score (0–100) for text-snippet search"),
 	];
 
-	private DiscordInteractionResponseBuilder BuildGlobalsMenu()
+	private DiscordInteractionResponseBuilder BuildGlobalsMenu(ulong guildId)
 	{
-		IReadOnlyList<ulong> debugUsers = config.DebugImpersonationUserIds;
+		IReadOnlyList<ulong> debugUsers = config.DebugImpersonationUserIds(guildId);
 		string debug = debugUsers.Count == 0 ? "*(disabled)*" : string.Join(", ", debugUsers.Select(id => $"<@{id}>"));
 
 		string content =
 			"**Global settings**\n" +
-			$"- Orphan timeout: **{config.OrphanTimeoutMinutes}** minutes\n" +
-			$"- Thread name max length: **{config.ThreadNameMaxLength}**\n" +
-			$"- Max attachment size: **{config.MaxAttachmentBytes}** bytes\n" +
-			$"- Search depth: **{config.SearchDepth}**\n" +
-			$"- Fuzzy threshold: **{config.FuzzyThreshold}**\n" +
+			$"- Orphan timeout: **{config.OrphanTimeoutMinutes(guildId)}** minutes\n" +
+			$"- Thread name max length: **{config.ThreadNameMaxLength(guildId)}**\n" +
+			$"- Max attachment size: **{config.MaxAttachmentBytes(guildId)}** bytes\n" +
+			$"- Search depth: **{config.SearchDepth(guildId)}**\n" +
+			$"- Fuzzy threshold: **{config.FuzzyThreshold(guildId)}**\n" +
 			$"- Debug masquerade users: {debug}\n\n" +
 			"Pick a setting to change:";
 
@@ -422,7 +425,7 @@ public class SetupCommands(BotConfig config, Database db, OrphanManager orphans,
 			case ["ttg", "pick"] when e.Values[0] == "debug":
 			{
 				DiscordUserSelectComponent select = new("ttg:debug", "Select debug users…", minOptions: 1, maxOptions: 25);
-				select.AddDefaultUsers(config.DebugImpersonationUserIds); // prefilled with the current list
+				select.AddDefaultUsers(config.DebugImpersonationUserIds(e.Interaction.Guild!.Id)); // prefilled with the current list
 				await UpdateAsync(e.Interaction, new DiscordInteractionResponseBuilder()
 					.WithContent("Who may use the `![name]` debug masquerade prefix? (This **replaces** the current list.)")
 					.AddActionRowComponent(select)
@@ -436,11 +439,11 @@ public class SetupCommands(BotConfig config, Database db, OrphanManager orphans,
 				(string _, string label, string _) = GlobalSettings.First(s => s.Key == key);
 				string current = key switch
 				{
-					"orphan_timeout_minutes" => config.OrphanTimeoutMinutes.ToString(),
-					"thread_name_max_length" => config.ThreadNameMaxLength.ToString(),
-					"max_attachment_bytes" => config.MaxAttachmentBytes.ToString(),
-					"search_depth" => config.SearchDepth.ToString(),
-					"fuzzy_threshold" => config.FuzzyThreshold.ToString(),
+					"orphan_timeout_minutes" => config.OrphanTimeoutMinutes(e.Interaction.Guild!.Id).ToString(),
+					"thread_name_max_length" => config.ThreadNameMaxLength(e.Interaction.Guild!.Id).ToString(),
+					"max_attachment_bytes" => config.MaxAttachmentBytes(e.Interaction.Guild!.Id).ToString(),
+					"search_depth" => config.SearchDepth(e.Interaction.Guild!.Id).ToString(),
+					"fuzzy_threshold" => config.FuzzyThreshold(e.Interaction.Guild!.Id).ToString(),
 					_ => "?",
 				};
 				DiscordModalBuilder modal = new DiscordModalBuilder()
@@ -452,25 +455,25 @@ public class SetupCommands(BotConfig config, Database db, OrphanManager orphans,
 			}
 
 			case ["ttg", "debug"]:
-				config.SetDebugUsers(e.Values.Select(ulong.Parse));
-				await UpdateAsync(e.Interaction, BuildGlobalsMenu());
+				config.SetDebugUsers(e.Interaction.Guild!.Id, e.Values.Select(ulong.Parse));
+				await UpdateAsync(e.Interaction, BuildGlobalsMenu(e.Interaction.Guild!.Id));
 				return;
 
 			case ["ttg", "debugclear"]:
-				config.SetDebugUsers([]);
-				await UpdateAsync(e.Interaction, BuildGlobalsMenu());
+				config.SetDebugUsers(e.Interaction.Guild!.Id, []);
+				await UpdateAsync(e.Interaction, BuildGlobalsMenu(e.Interaction.Guild!.Id));
 				return;
 		}
 	}
 
-	private string? TrySetGlobal(string key, string value)
+	private string? TrySetGlobal(ulong guildId, string key, string value)
 	{
 		switch (key)
 		{
 			case "max_attachment_bytes":
 				if (!long.TryParse(value, out long bytes) || bytes < 0)
 					return "That needs to be a non-negative whole number of bytes — run /botsettings to try again.";
-				config.SetGlobal(key, bytes.ToString());
+				config.SetGlobal(guildId, key, bytes.ToString());
 				return null;
 
 			case "orphan_timeout_minutes" or "thread_name_max_length" or "search_depth" or "fuzzy_threshold":
@@ -485,7 +488,7 @@ public class SetupCommands(BotConfig config, Database db, OrphanManager orphans,
 				};
 				if (!int.TryParse(value, out int number) || number < min || number > max)
 					return $"That needs to be a whole number between {min} and {max} — run /botsettings to try again.";
-				config.SetGlobal(key, number.ToString());
+				config.SetGlobal(guildId, key, number.ToString());
 				return null;
 			}
 

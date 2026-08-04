@@ -88,7 +88,7 @@ public class Transposer(BotConfig config, Database db)
 
 	private string ThreadNameFor(DiscordMessage anchor)
 	{
-		int max = Math.Clamp(config.ThreadNameMaxLength, 10, 95); // Discord caps thread names at 100
+		int max = Math.Clamp(config.ThreadNameMaxLength(anchor.Channel?.GuildId ?? 0), 10, 95); // Discord caps thread names at 100
 		string name = (anchor.Content ?? "").Replace('\n', ' ').Trim();
 		if (name.Length == 0)
 			name = $"Discussion — {(anchor.Author as DiscordMember)?.DisplayName ?? anchor.Author?.Username ?? "post"}";
@@ -102,7 +102,7 @@ public class Transposer(BotConfig config, Database db)
 	/// impersonation) and records the mapping.
 	/// </summary>
 	/// <returns>The first message of the reposted copy (callers may decorate it, e.g. reaction echoes).</returns>
-	public async Task<DiscordMessage> RepostAsync(DiscordClient client, DiscordThreadChannel thread, MovableContent content, ulong originalMessageId, RepostStyle style)
+	public async Task<DiscordMessage> RepostAsync(DiscordClient client, DiscordThreadChannel thread, MovableContent content, ulong originalMessageId, RepostStyle style, string? replyHeader = null)
 	{
 		// Callers can arrive here with a mapped thread that bypassed GetOrCreateThreadAsync,
 		// and webhooks cannot post into archived threads — so unarchive defensively.
@@ -113,7 +113,7 @@ public class Transposer(BotConfig config, Database db)
 		// instead of impersonating via webhook.
 		if (style == RepostStyle.Bot)
 		{
-			DiscordMessage botFirst = await SendAsBotAsync(b => thread.SendMessageAsync(b), content, header: null);
+			DiscordMessage botFirst = await SendAsBotAsync(b => thread.SendMessageAsync(b), content, header: replyHeader);
 			db.RecordTransposed(originalMessageId, thread.Id);
 			return botFirst;
 		}
@@ -142,6 +142,8 @@ public class Transposer(BotConfig config, Database db)
 		string text = content.Content;
 		if (content.Notes.Length > 0)
 			text = text.Length > 0 ? $"{text}\n{content.Notes}" : content.Notes;
+		if (replyHeader is not null)
+			text = text.Length > 0 ? $"{replyHeader}\n{text}" : replyHeader;
 
 		// Forwards and notes can push past Discord's 2000-char cap; chunk if needed.
 		List<string> chunks = Chunk(text, 2000);
@@ -332,6 +334,21 @@ public class Transposer(BotConfig config, Database db)
 
 	/// <summary>The subtext header a pseudo-reply carries in place of a real reply reference.</summary>
 	public static string ReplyHeaderFor(DiscordMessage target) => $"-# ↪ in reply to {target.JumpLink}";
+
+	/// <summary>
+	/// Extracts the target message ID from a pseudo-reply header line, if present — the
+	/// jump link's last path segment. Lets the sweep treat pseudo-replies as reply-graph
+	/// links even though they carry no real Discord reference.
+	/// </summary>
+	public static ulong? ParseReplyHeaderTarget(string? content)
+	{
+		if (content is null || !content.StartsWith("-# ↪", StringComparison.Ordinal))
+			return null;
+		int newline = content.IndexOf('\n');
+		string line = newline < 0 ? content : content[..newline];
+		int slash = line.LastIndexOf('/');
+		return slash >= 0 && ulong.TryParse(line[(slash + 1)..].Trim(), out ulong id) ? id : null;
+	}
 
 	/// <summary>Strips a pseudo-reply header line so re-transposition into a thread doesn't drag it along.</summary>
 	public static string? StripReplyHeader(string? content)

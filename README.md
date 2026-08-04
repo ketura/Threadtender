@@ -37,9 +37,9 @@ Every managed channel runs in one of three modes, chosen when you `/bind` it:
 Only one rule: comments from non-whitelisted users must be **replies**. Replies of any
 kind are left untouched. A non-reply comment gets the same "which post did you mean?"
 flow as pure mode, but resolution puts the comment back **in the channel** as a
-pseudo-reply: a bot repost (`@user:` + text) whose first line links the target post
-(bots cannot create reply references on behalf of someone else, so the link header
-stands in for it).
+pseudo-reply: a webhook repost under the commenter's name and avatar, whose first
+line links the target post (webhooks cannot create real reply references, so the
+link header stands in for it).
 
 ### Flex-Thread-Enforcement
 
@@ -53,9 +53,12 @@ of text adds another — so five short quips and one wall of text weigh comparab
 graph** is transposed into it, oldest first. The sweep reposts through webhooks wearing
 each original author's name and avatar (it re-presents a conversation that already
 happened, so it should read naturally) and ends with one mass ping — "*@a @b — created
-discussion thread*" — so everyone whose messages moved knows where they went. Emoji
-reactions can't be transposed, but the bot echoes each reaction emoji onto the moved
-copy as an invitation to re-react (external emojis it can't use are skipped).
+discussion thread*" — so everyone whose messages moved knows where they went. Reply
+chains among the swept comments are recreated as link headers pointing at each
+parent's copy in the thread (direct replies to the root need no marker — sequential
+flow implies them). Emoji reactions can't be transposed, but the bot echoes each
+reaction emoji onto the moved copy as an invitation to re-react (external emojis it
+can't use are skipped).
 From then on that post behaves like pure mode: further replies to it (or to
 any moved comment) are auto-transposed into its thread. Whitelisted authors'
 self-reply continuations are exempt as usual — never counted, never swept.
@@ -123,9 +126,10 @@ takes precedence.
 - **/unbind** — pick a bound channel, confirm, done. Pending "which post?" prompts in
   that channel are cancelled and their content returned to the authors; existing
   threads and moved messages stay where they are.
-- **/botsettings** — view and edit the global knobs: orphan timeout, thread name max
-  length, max attachment size, search depth, fuzzy threshold, and the debug masquerade
-  user list.
+- **/botsettings** — view and edit this server's settings: orphan timeout, thread name
+  max length, max attachment size, search depth, fuzzy threshold, and the debug
+  masquerade user list. All of these are **per-server** — servers sharing the bot never
+  see each other's configuration.
 
 All command flows are ephemeral — no channel clutter. Commands are registered per
 guild on startup, so they appear as soon as the bot connects.

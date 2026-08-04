@@ -66,6 +66,9 @@ DiscordClientBuilder builder = DiscordClientBuilder
 			await setup.HandleModalAsync(client, e);
 		})
 		.HandleInteractionCreated(setup.HandleInteractionAsync)
+		// Joining a new server mid-run registers the setup commands immediately —
+		// otherwise they wouldn't appear there until the next restart.
+		.HandleGuildCreated(async (client, e) => await setup.RegisterGuildAsync(e.Guild))
 		.HandleGuildDownloadCompleted(async (client, _) =>
 		{
 			// Re-arm timeouts for orphans that were pending when we last shut down,
