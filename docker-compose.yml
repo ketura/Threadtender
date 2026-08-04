@@ -1,0 +1,11 @@
+services:
+  threadtender:
+    build: .
+    container_name: threadtender
+    restart: unless-stopped
+    volumes:
+      - ./data:/data
+    environment:
+      # Optional: overrides the token in data/settings.json so the config file
+      # can be committed/shared without secrets.
+      - DISCORD_TOKEN=${DISCORD_TOKEN:-}
