@@ -14,4 +14,16 @@
     <PackageReference Include="SQLitePCLRaw.bundle_e_sqlite3" Version="3.0.5" />
   </ItemGroup>
 
+  <!-- The repo-root settings.json is the canonical config for local runs: every build
+       and publish refreshes the output data folder's copy from it (root wins over any
+       manual edits made in the output folder). The Docker build deliberately never sees
+       this file, so tokens are not baked into image layers; compose bind-mounts it at
+       runtime instead. -->
+  <Target Name="CopyRootSettingsOnBuild" AfterTargets="Build" Condition="Exists('$(MSBuildProjectDirectory)/../settings.json')">
+    <Copy SourceFiles="$(MSBuildProjectDirectory)/../settings.json" DestinationFolder="$(OutDir)data" SkipUnchangedFiles="true" />
+  </Target>
+  <Target Name="CopyRootSettingsOnPublish" AfterTargets="Publish" Condition="Exists('$(MSBuildProjectDirectory)/../settings.json')">
+    <Copy SourceFiles="$(MSBuildProjectDirectory)/../settings.json" DestinationFolder="$(PublishDir)data" SkipUnchangedFiles="true" />
+  </Target>
+
 </Project>

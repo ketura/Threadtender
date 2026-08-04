@@ -8,5 +8,6 @@ RUN dotnet publish ThreadTender/ThreadTender.csproj -c Release -o /app --no-rest
 FROM mcr.microsoft.com/dotnet/runtime:10.0
 WORKDIR /app
 COPY --from=build /app .
+ENV DATA_DIR=/data
 VOLUME /data
 ENTRYPOINT ["dotnet", "ThreadTender.dll"]

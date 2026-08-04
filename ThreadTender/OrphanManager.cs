@@ -10,10 +10,12 @@ namespace ThreadTender;
 /// <summary>
 /// Handles non-reply comments from non-whitelisted users: deletes and stores the
 /// comment, prompts the commenter for the post they meant to reply to (recent-post
-/// select, or message ID / text snippet via modal), then transposes on resolution.
-/// Pending comments survive restarts; unresolved ones are DMed back on timeout.
+/// select, or message ID / text snippet via modal), then resolves according to the
+/// channel's mode — into the post's thread (pure, or flex once swept) or back into the
+/// channel as a pseudo-reply (reply/flex). Pending comments survive restarts;
+/// unresolved ones are DMed back on timeout.
 /// </summary>
-public class OrphanManager(BotConfig config, Database db, Transposer transposer, string dataDir)
+public class OrphanManager(BotConfig config, Database db, Transposer transposer, FlexThreader flex, string dataDir)
 {
 	private readonly ConcurrentDictionary<ulong, CancellationTokenSource> timeouts = new();
 	private readonly ConcurrentDictionary<ulong, byte> processing = new();
@@ -23,20 +25,27 @@ public class OrphanManager(BotConfig config, Database db, Transposer transposer,
 
 	private string PendingDir(ulong messageId) => Path.Combine(dataDir, "pending", messageId.ToString());
 
+	/// <summary>How a pending orphan addresses its author: mention for real users, bold name for synthetic ones.</summary>
+	private static string AddresseeFor(PendingOrphan pending) =>
+		pending.AuthorName.Length > 0 ? $"**{pending.AuthorName}**" : $"<@{pending.AuthorId}>";
+
 	// ---------------------------------------------------------------- intake
 
-	public async Task InterceptAsync(DiscordClient client, DiscordMessage message)
+	public async Task InterceptAsync(DiscordClient client, DiscordMessage message, EffectiveAuthor author, string? contentOverride)
 	{
 		// Gateway events are at-least-once; a replayed event for an already-intercepted
-		// message must not touch the existing pending record or its stored files.
+		// (or already-resolved) message must not touch existing state or re-prompt.
 		if (db.GetAllPending().Any(p => p.MessageId == message.Id))
 			return;
+		if (db.GetTransposedThread(message.Id) is not null)
+			return;
 
-		MovableContent content = await MovableContent.CaptureAsync(message, PendingDir(message.Id), config.MaxAttachmentBytes);
+		MovableContent content = await MovableContent.CaptureAsync(message, PendingDir(message.Id), config.MaxAttachmentBytes,
+			author.Id, author.NameOverride, contentOverride);
 
 		// Persist BEFORE deleting — from here on, the content can always be recovered.
-		PendingOrphan pending = new(message.Id, message.ChannelId, message.Channel!.Guild.Id, message.Author!.Id,
-			content.Content, content.Notes, 0,
+		PendingOrphan pending = new(message.Id, message.ChannelId, message.Channel!.Guild.Id, author.Id,
+			content.Content, content.Notes, author.NameOverride ?? "", 0,
 			DateTimeOffset.UtcNow.AddMinutes(config.OrphanTimeoutMinutes));
 		db.UpsertPending(pending);
 
@@ -74,10 +83,11 @@ public class OrphanManager(BotConfig config, Database db, Transposer transposer,
 
 		DiscordMessageBuilder prompt = new DiscordMessageBuilder()
 			.WithContent(
-				$"<@{message.Author!.Id}> — this channel keeps discussion in threads, so I've set your message aside for a moment. " +
+				$"{AddresseeFor(pending)} — this channel keeps discussion attached to posts, so I've set your message aside for a moment. " +
 				$"**Which post were you replying to?** Pick one below, or give me a message ID / a snippet of its text. " +
-				$"You have {config.OrphanTimeoutMinutes} minutes; after that I'll DM your text back to you so nothing is lost.")
-			.WithAllowedMentions([new UserMention(message.Author.Id)]);
+				$"You have {config.OrphanTimeoutMinutes} minutes; after that I'll DM your text back to you so nothing is lost.");
+		if (pending.AuthorName.Length == 0)
+			prompt.WithAllowedMentions([new UserMention(pending.AuthorId)]);
 
 		if (candidates.Count > 0)
 		{
@@ -121,7 +131,9 @@ public class OrphanManager(BotConfig config, Database db, Transposer transposer,
 			return;
 		}
 
-		if (e.User.Id != pending.AuthorId)
+		// Debug users may drive any prompt: masqueraded orphans belong to identities
+		// that can't click buttons themselves.
+		if (e.User.Id != pending.AuthorId && !config.IsDebugUser(e.User.Id))
 		{
 			await RespondEphemeralAsync(e.Interaction, "This prompt belongs to someone else's message.");
 			return;
@@ -260,12 +272,78 @@ public class OrphanManager(BotConfig config, Database db, Transposer transposer,
 			return;
 		}
 
-		DiscordThreadChannel thread;
+		ChannelBinding? binding = config.GetBinding(pending.ChannelId);
+		if (binding is null)
+		{
+			// The channel was unbound while this prompt sat open; return the content.
+			processing.TryRemove(pending.MessageId, out _);
+			await NotifyAsync(interaction, "This channel is no longer managed by the bot — I'll send your message back to you.", editOriginal);
+			await CancelAsync(client, pending, dmContent: true);
+			return;
+		}
+
 		try
 		{
-			DiscordMessage anchor = await Transposer.WalkToRootAsync(target);
-			thread = await transposer.GetOrCreateThreadAsync(client, anchor);
-			await transposer.RepostAsync(client, thread, RehydrateContent(pending), pending.MessageId);
+			DiscordChannel channel = await client.GetChannelAsync(pending.ChannelId);
+
+			// Graph-aware in flex channels; a plain reply-chain walk everywhere else.
+			// The raw-ID path can point at anything in the channel (a bot prompt,
+			// another orphan) — only whitelisted authors' posts may be resolution targets.
+			DiscordMessage? root = await flex.ResolveRootAsync(channel, target);
+			if (root is null || root.Author is null || root.Author.IsBot || !config.IsWhitelisted(pending.ChannelId, root.Author.Id))
+			{
+				processing.TryRemove(pending.MessageId, out _);
+				await NotifyAsync(interaction, "That message isn't one of this channel's top-level posts — press the button and pick again.", editOriginal);
+				return;
+			}
+
+			switch (binding.Mode)
+			{
+				case ChannelMode.PureThread:
+				{
+					DiscordThreadChannel thread = await transposer.GetOrCreateThreadAsync(client, root);
+					await transposer.RepostAsync(client, thread, RehydrateContent(pending), pending.MessageId);
+					await CleanupAsync(client, pending, deletePrompt: true);
+					await NotifyAsync(interaction, $"✅ Moved to {thread.Mention}.", editOriginal);
+					break;
+				}
+
+				case ChannelMode.ReplyOnly:
+				{
+					await transposer.RepostToChannelAsync(client, channel, RehydrateContent(pending), pending.MessageId, target);
+					await CleanupAsync(client, pending, deletePrompt: true);
+					await DismissAsync(interaction, editOriginal);
+					break;
+				}
+
+				case ChannelMode.FlexThread:
+				{
+					// A post that has already been swept behaves like pure mode.
+					ulong? threadId = db.GetFlexThread(root.Id);
+					DiscordThreadChannel? existing = threadId is null ? null : await TryGetThreadAsync(client, threadId.Value);
+					if (existing is not null)
+					{
+						await transposer.RepostAsync(client, existing, RehydrateContent(pending), pending.MessageId);
+						await CleanupAsync(client, pending, deletePrompt: true);
+						await NotifyAsync(interaction, $"✅ Moved to {existing.Mention}.", editOriginal);
+						break;
+					}
+
+					ulong repostId = await transposer.RepostToChannelAsync(client, channel, RehydrateContent(pending), pending.MessageId, target);
+					await CleanupAsync(client, pending, deletePrompt: true);
+					await DismissAsync(interaction, editOriginal);
+
+					// The repost is a comment in the root's graph: count it, possibly
+					// sweeping the whole graph (repost included) into a thread. The user's
+					// content is already safe at this point, so a sweep failure must not
+					// surface as "something went wrong" — the edge is recorded before the
+					// sweep runs, and the next comment on this root will retry it.
+					EffectiveAuthor author = new(pending.AuthorId, pending.AuthorName.Length > 0 ? pending.AuthorName : null);
+					try { await flex.RecordCommentAsync(client, binding, channel, repostId, author, root); }
+					catch (Exception) { }
+					break;
+				}
+			}
 		}
 		catch (Exception)
 		{
@@ -273,9 +351,24 @@ public class OrphanManager(BotConfig config, Database db, Transposer transposer,
 			await NotifyAsync(interaction, "Something went wrong moving your message — please try again.", editOriginal);
 			throw;
 		}
+	}
 
-		await CleanupAsync(client, pending, deletePrompt: true);
-		await NotifyAsync(interaction, $"✅ Moved to {thread.Mention}.", editOriginal);
+	private static async Task<DiscordThreadChannel?> TryGetThreadAsync(DiscordClient client, ulong threadId)
+	{
+		try { return await client.GetChannelAsync(threadId) as DiscordThreadChannel; }
+		catch (NotFoundException) { return null; }
+	}
+
+	/// <summary>
+	/// Channel reposts need no confirmation — the repost appearing in the channel IS the
+	/// feedback. Clears the ephemeral instead of announcing (errors still use NotifyAsync).
+	/// </summary>
+	private static async Task DismissAsync(DiscordInteraction interaction, bool editOriginal)
+	{
+		if (!editOriginal)
+			return; // deferred update on the prompt, which cleanup just deleted; nothing shows
+		try { await interaction.DeleteOriginalResponseAsync(); }
+		catch (Exception) { } // an undeletable ephemeral is cosmetic; never fail the resolution over it
 	}
 
 	private static Task NotifyAsync(DiscordInteraction interaction, string content, bool editOriginal) =>
@@ -296,7 +389,8 @@ public class OrphanManager(BotConfig config, Database db, Transposer transposer,
 				files.Add((underscore >= 0 ? fileName[(underscore + 1)..] : fileName, path));
 			}
 		}
-		return new MovableContent(pending.AuthorId, pending.Content, files, pending.Notes);
+		return new MovableContent(pending.AuthorId, pending.Content, files, pending.Notes,
+			pending.AuthorName.Length > 0 ? pending.AuthorName : null);
 	}
 
 	// ---------------------------------------------------------------- timeout / cancel
@@ -305,6 +399,13 @@ public class OrphanManager(BotConfig config, Database db, Transposer transposer,
 	{
 		foreach (PendingOrphan pending in db.GetAllPending())
 			ScheduleTimeout(client, pending);
+	}
+
+	/// <summary>Returns every pending orphan in a channel to its author (used when the channel is unbound).</summary>
+	public async Task CancelAllForChannelAsync(DiscordClient client, ulong channelId)
+	{
+		foreach (PendingOrphan pending in db.GetAllPending().Where(p => p.ChannelId == channelId))
+			await CancelAsync(client, pending, dmContent: true);
 	}
 
 	private void ScheduleTimeout(DiscordClient client, PendingOrphan pending)
@@ -357,7 +458,8 @@ public class OrphanManager(BotConfig config, Database db, Transposer transposer,
 			}
 			catch (Exception)
 			{
-				// DMs closed or member unreachable — fall back to the channel below.
+				// DMs closed or member unreachable (synthetic debug identities always
+				// land here) — fall back to the channel below.
 			}
 
 			if (!delivered)
@@ -366,8 +468,8 @@ public class OrphanManager(BotConfig config, Database db, Transposer transposer,
 				{
 					DiscordChannel channel = await client.GetChannelAsync(pending.ChannelId);
 					await SendContentBackAsync(b => channel.SendMessageAsync(b), pending, content,
-						$"<@{pending.AuthorId}> I couldn't DM you, so here's your unattached comment back — grab it from here:",
-						mention: true);
+						$"{AddresseeFor(pending)} I couldn't DM you, so here's your unattached comment back — grab it from here:",
+						mention: pending.AuthorName.Length == 0);
 					delivered = true;
 				}
 				catch (Exception)
@@ -382,7 +484,14 @@ public class OrphanManager(BotConfig config, Database db, Transposer transposer,
 				pending = pending with { ExpiresAt = DateTimeOffset.UtcNow.AddMinutes(config.OrphanTimeoutMinutes) };
 				db.UpsertPending(pending);
 				if (timeouts.TryRemove(pending.MessageId, out CancellationTokenSource? stale))
+				{
+					// Cancel before disposing: if this cancellation came from the Cancel
+					// button rather than the timer itself, the original timer task is still
+					// counting down and would otherwise fire a duplicate retry at the old
+					// expiry alongside the one we're about to arm.
+					stale.Cancel();
 					stale.Dispose();
+				}
 				processing.TryRemove(pending.MessageId, out _);
 				ScheduleTimeout(client, pending);
 				return;

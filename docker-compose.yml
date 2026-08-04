@@ -5,6 +5,9 @@ services:
     restart: unless-stopped
     volumes:
       - ./data:/data
+      # The repo-root settings.json is the live config in Docker too. It must exist as a
+      # file BEFORE `docker compose up`, or Docker will create a directory in its place.
+      - ./settings.json:/data/settings.json
     environment:
       # Optional: overrides the token in data/settings.json so the config file
       # can be committed/shared without secrets.

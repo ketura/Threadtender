@@ -3,3 +3,4 @@ obj/
 data/
 *.user
 .idea/
+settings.json

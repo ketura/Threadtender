@@ -19,8 +19,11 @@ public class Transposer(BotConfig config, Database db)
 	/// <summary>Walks a reply chain up to its top-level root message.</summary>
 	public static async Task<DiscordMessage> WalkToRootAsync(DiscordMessage message)
 	{
+		// Whitelisted authors build long top-level self-reply chains by design, and a cap
+		// that's too low would anchor threads mid-chain, fragmenting discussion. 50 is a
+		// backstop against reference cycles, not an expected length.
 		DiscordMessage current = message;
-		for (int depth = 0; depth < 10 && current.MessageType == DiscordMessageType.Reply; depth++)
+		for (int depth = 0; depth < 50 && current.MessageType == DiscordMessageType.Reply; depth++)
 		{
 			DiscordMessage? referenced = current.ReferencedMessage;
 			if (referenced is null && current.Reference?.Message is not null)
@@ -86,7 +89,7 @@ public class Transposer(BotConfig config, Database db)
 
 	/// <summary>
 	/// Reposts captured content into the given thread as its original author (webhook
-	/// impersonation), pings the author there, and records the mapping.
+	/// impersonation) and records the mapping.
 	/// </summary>
 	public async Task RepostAsync(DiscordClient client, DiscordThreadChannel thread, MovableContent content, ulong originalMessageId)
 	{
@@ -98,7 +101,7 @@ public class Transposer(BotConfig config, Database db)
 		DiscordChannel parent = await client.GetChannelAsync(thread.ParentId
 			?? throw new InvalidOperationException($"Thread {thread.Id} has no parent"));
 
-		(string displayName, string avatarUrl) = await ResolveIdentityAsync(client, thread.Guild, content.AuthorId);
+		(string displayName, string? avatarUrl) = await ResolveIdentityAsync(client, thread.Guild, content);
 		DiscordWebhook webhook = await GetOrCreateWebhookAsync(parent);
 
 		// Retries once with a fresh webhook if the cached one was deleted out from under us.
@@ -123,13 +126,24 @@ public class Transposer(BotConfig config, Database db)
 		// Forwards and notes can push past Discord's 2000-char cap; chunk if needed.
 		List<string> chunks = Chunk(text, 2000);
 
+		// A message can end up with no movable payload at all (e.g. a bare ![name]
+		// masquerade prefix that stripping reduced to nothing). Discord rejects an
+		// empty webhook execute outright — post a placeholder rather than dying.
+		if (chunks.Count == 0 && content.Files.Count == 0)
+			chunks.Add("*(empty message)*");
+
 		// Note: no AddMentions() call on these builders — with an empty mention list the
 		// library sends allowed_mentions: none, so the repost cannot re-ping anyone. The
 		// original message already fired its notifications before we deleted it.
-		DiscordWebhookBuilder builder = new DiscordWebhookBuilder()
-			.WithUsername(displayName)
-			.WithAvatarUrl(avatarUrl)
-			.WithThreadId(thread.Id);
+		DiscordWebhookBuilder NewBuilder()
+		{
+			DiscordWebhookBuilder b = new DiscordWebhookBuilder().WithUsername(displayName).WithThreadId(thread.Id);
+			if (avatarUrl is not null)
+				b.WithAvatarUrl(avatarUrl);
+			return b;
+		}
+
+		DiscordWebhookBuilder builder = NewBuilder();
 		if (chunks.Count > 0)
 			builder.WithContent(chunks[0]);
 
@@ -151,17 +165,90 @@ public class Transposer(BotConfig config, Database db)
 		}
 
 		foreach (string chunk in chunks.Skip(1))
-		{
-			await ExecuteResilientAsync(new DiscordWebhookBuilder()
-				.WithUsername(displayName).WithAvatarUrl(avatarUrl).WithThreadId(thread.Id)
-				.WithContent(chunk));
-		}
+			await ExecuteResilientAsync(NewBuilder().WithContent(chunk));
 
 		db.RecordTransposed(originalMessageId, thread.Id);
+	}
 
-		await thread.SendMessageAsync(new DiscordMessageBuilder()
-			.WithContent($"<@{content.AuthorId}> — moved your message into this thread.")
-			.WithAllowedMentions([new UserMention(content.AuthorId)]));
+	/// <summary>
+	/// Reply-Enforcement repost: puts captured content back into the main channel as a
+	/// webhook-impersonated pseudo-reply. Webhooks cannot create real Discord replies,
+	/// so a subtext header links the target instead. Returns the reposted message's ID
+	/// (the first chunk's, when chunked) so callers can record it as a graph member.
+	/// </summary>
+	public async Task<ulong> RepostToChannelAsync(DiscordClient client, DiscordChannel channel, MovableContent content, ulong originalMessageId, DiscordMessage replyTarget)
+	{
+		(string displayName, string? avatarUrl) = await ResolveIdentityAsync(client, channel.Guild, content);
+		DiscordWebhook webhook = await GetOrCreateWebhookAsync(channel);
+
+		async Task<DiscordMessage> ExecuteResilientAsync(DiscordWebhookBuilder b)
+		{
+			try
+			{
+				return await webhook.ExecuteAsync(b);
+			}
+			catch (NotFoundException)
+			{
+				webhookCache.TryRemove(channel.Id, out _);
+				webhook = await GetOrCreateWebhookAsync(channel);
+				return await webhook.ExecuteAsync(b);
+			}
+		}
+
+		DiscordWebhookBuilder NewBuilder()
+		{
+			DiscordWebhookBuilder b = new DiscordWebhookBuilder().WithUsername(displayName);
+			if (avatarUrl is not null)
+				b.WithAvatarUrl(avatarUrl);
+			return b;
+		}
+
+		string text = ReplyHeaderFor(replyTarget);
+		if (content.Content.Length > 0)
+			text += $"\n{content.Content}";
+		if (content.Notes.Length > 0)
+			text += $"\n{content.Notes}";
+		List<string> chunks = Chunk(text, 2000);
+
+		DiscordWebhookBuilder builder = NewBuilder().WithContent(chunks[0]);
+
+		DiscordMessage first;
+		List<FileStream> streams = [];
+		try
+		{
+			foreach ((string name, string path) in content.Files)
+			{
+				FileStream stream = File.OpenRead(path);
+				streams.Add(stream);
+				builder.AddFile(name, stream);
+			}
+			first = await ExecuteResilientAsync(builder);
+		}
+		finally
+		{
+			foreach (FileStream stream in streams)
+				await stream.DisposeAsync();
+		}
+
+		foreach (string chunk in chunks.Skip(1))
+			await ExecuteResilientAsync(NewBuilder().WithContent(chunk));
+
+		// thread_id 0 = "moved, but not into a thread": guards against replayed events
+		// re-intercepting a message we already handled.
+		db.RecordTransposed(originalMessageId, 0);
+		return first.Id;
+	}
+
+	/// <summary>The subtext header a pseudo-reply carries in place of a real reply reference.</summary>
+	public static string ReplyHeaderFor(DiscordMessage target) => $"-# ↪ in reply to {target.JumpLink}";
+
+	/// <summary>Strips a pseudo-reply header line so re-transposition into a thread doesn't drag it along.</summary>
+	public static string? StripReplyHeader(string? content)
+	{
+		if (content is null || !content.StartsWith("-# ↪", StringComparison.Ordinal))
+			return content;
+		int newline = content.IndexOf('\n');
+		return newline < 0 ? "" : content[(newline + 1)..];
 	}
 
 	internal static List<string> Chunk(string text, int max)
@@ -182,17 +269,28 @@ public class Transposer(BotConfig config, Database db)
 		return chunks;
 	}
 
-	private static async Task<(string DisplayName, string AvatarUrl)> ResolveIdentityAsync(DiscordClient client, DiscordGuild guild, ulong userId)
+	private static async Task<(string DisplayName, string? AvatarUrl)> ResolveIdentityAsync(DiscordClient client, DiscordGuild guild, MovableContent content)
 	{
+		// Synthetic debug identities carry their own name and have no resolvable ID.
+		if (content.AuthorName is not null)
+			return (content.AuthorName, null);
+
 		try
 		{
-			DiscordMember member = await guild.GetMemberAsync(userId);
+			DiscordMember member = await guild.GetMemberAsync(content.AuthorId);
 			return (member.DisplayName, member.GuildAvatarUrl ?? member.AvatarUrl);
 		}
 		catch (NotFoundException)
 		{
-			DiscordUser user = await client.GetUserAsync(userId);
-			return (user.Username, user.AvatarUrl);
+			try
+			{
+				DiscordUser user = await client.GetUserAsync(content.AuthorId);
+				return (user.Username, user.AvatarUrl);
+			}
+			catch (NotFoundException)
+			{
+				return ($"Unknown User ({content.AuthorId})", null);
+			}
 		}
 	}
 

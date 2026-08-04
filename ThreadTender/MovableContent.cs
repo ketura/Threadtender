@@ -5,20 +5,24 @@ namespace ThreadTender;
 /// <summary>
 /// A message's transportable payload: text, downloaded attachment files, and notes
 /// about anything that could not survive the move (stickers, polls, oversized files).
+/// AuthorName is set only for synthetic debug identities (see Masquerade) — when
+/// present it overrides ID-based identity resolution for webhook impersonation.
 /// </summary>
-public record MovableContent(ulong AuthorId, string Content, List<(string Name, string Path)> Files, string Notes)
+public record MovableContent(ulong AuthorId, string Content, List<(string Name, string Path)> Files, string Notes, string? AuthorName = null)
 {
 	private static readonly HttpClient http = new();
 
 	/// <summary>
 	/// Captures everything movable from a live message, downloading attachments into
 	/// <paramref name="storageDir"/>. Must be called before the message is deleted.
+	/// The override parameters carry masqueraded identity / pre-stripped content.
 	/// </summary>
-	public static async Task<MovableContent> CaptureAsync(DiscordMessage message, string storageDir, long maxAttachmentBytes)
+	public static async Task<MovableContent> CaptureAsync(DiscordMessage message, string storageDir, long maxAttachmentBytes,
+		ulong? authorIdOverride = null, string? authorNameOverride = null, string? contentOverride = null)
 	{
 		List<string> notes = [];
 		List<(string Name, string Path)> files = [];
-		string content = message.Content ?? "";
+		string content = contentOverride ?? message.Content ?? "";
 
 		// Forwarded messages carry their payload in snapshots.
 		if (message.MessageSnapshots is { Count: > 0 })
@@ -67,7 +71,7 @@ public record MovableContent(ulong AuthorId, string Content, List<(string Name, 
 		if (message.Poll is not null)
 			notes.Add("*(a poll was attached and could not be moved)*");
 
-		return new MovableContent(message.Author?.Id ?? 0, content, files, string.Join("\n", notes));
+		return new MovableContent(authorIdOverride ?? message.Author?.Id ?? 0, content, files, string.Join("\n", notes), authorNameOverride);
 	}
 
 	public void DeleteFiles()
