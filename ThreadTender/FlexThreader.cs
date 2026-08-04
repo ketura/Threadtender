@@ -16,6 +16,14 @@ public class FlexThreader(BotConfig config, Database db, Transposer transposer, 
 	private readonly ConcurrentDictionary<ulong, SemaphoreSlim> rootLocks = new();
 
 	/// <summary>
+	/// A comment's "line" weight: character count divided by 60, plus one — a 20-char
+	/// message is still one line, it just hasn't wrapped yet. Deliberately naive
+	/// otherwise (no newline handling). Five short quips and one wall of text weigh
+	/// comparably.
+	/// </summary>
+	public static int LinesOf(string? content) => (content ?? "").Length / 60 + 1;
+
+	/// <summary>
 	/// Resolves the top-level post a comment ultimately belongs to, following both real
 	/// reply chains and recorded graph edges (pseudo-reply reposts aren't Discord
 	/// replies, so the walk alone can't see through them). Returns null when the
@@ -27,7 +35,8 @@ public class FlexThreader(BotConfig config, Database db, Transposer transposer, 
 		ulong? rootId = db.GetGraphRoot(target.Id);
 		if (rootId is null)
 		{
-			DiscordMessage walked = await Transposer.WalkToRootAsync(target);
+			DiscordMessage walked = await Transposer.WalkToRootAsync(target,
+				m => config.IsWhitelisted(channel.Id, m.Author?.Id ?? 0));
 			rootId = db.GetGraphRoot(walked.Id);
 			if (rootId is null)
 				return walked;
@@ -43,15 +52,22 @@ public class FlexThreader(BotConfig config, Database db, Transposer transposer, 
 	/// already exists (this comment raced past the mode switch), the sweep just moves
 	/// whatever edges remain — including the one recorded here.
 	/// </summary>
-	public async Task RecordCommentAsync(DiscordClient client, ChannelBinding binding, DiscordChannel channel, ulong commentId, EffectiveAuthor author, DiscordMessage root)
+	public async Task RecordCommentAsync(DiscordClient client, ChannelBinding binding, DiscordChannel channel, ulong commentId, int lineCount, EffectiveAuthor author, DiscordMessage root)
 	{
 		SemaphoreSlim gate = rootLocks.GetOrAdd(root.Id, _ => new SemaphoreSlim(1, 1));
 		await gate.WaitAsync();
 		try
 		{
-			db.AddGraphEdge(commentId, root.Id, channel.Id, author.Id, author.NameOverride ?? "");
+			db.AddGraphEdge(commentId, root.Id, channel.Id, author.Id, author.NameOverride ?? "", lineCount);
 
-			if (db.GetFlexThread(root.Id) is not null || db.CountGraph(root.Id) > binding.FlexThreshold)
+			// Dual threshold: either enough messages, or enough total text — reaching a
+			// threshold triggers (the 5th comment sweeps at threshold 5). Line
+			// threshold 0 = message count only.
+			(int messages, int lines) = db.GetGraphStats(root.Id);
+			bool overThreshold = messages >= binding.FlexThreshold
+				|| (binding.FlexLineThreshold > 0 && lines >= binding.FlexLineThreshold);
+
+			if (db.GetFlexThread(root.Id) is not null || overThreshold)
 				await SweepGraphAsync(client, channel, root);
 		}
 		finally
@@ -110,7 +126,7 @@ public class FlexThreader(BotConfig config, Database db, Transposer transposer, 
 			return false; // already known
 
 		// Re-run masquerade resolution so a historical ![name] message keeps its identity.
-		(EffectiveAuthor author, string? _) = await Masquerade.ResolveAsync(config, message);
+		(EffectiveAuthor author, string? contentOverride) = await Masquerade.ResolveAsync(config, message);
 
 		DiscordMessage? target = message.ReferencedMessage;
 		if (target is null && message.Reference?.Message is not null)
@@ -135,7 +151,8 @@ public class FlexThreader(BotConfig config, Database db, Transposer transposer, 
 		if (db.GetFlexThread(root.Id) is not null)
 			return false; // root already swept; live replies to it route straight to its thread
 
-		db.AddGraphEdge(message.Id, root.Id, channel.Id, author.Id, author.NameOverride ?? "");
+		db.AddGraphEdge(message.Id, root.Id, channel.Id, author.Id, author.NameOverride ?? "",
+			LinesOf(contentOverride ?? message.Content));
 		return true;
 	}
 
@@ -145,12 +162,30 @@ public class FlexThreader(BotConfig config, Database db, Transposer transposer, 
 		DiscordThreadChannel thread = await transposer.GetOrCreateThreadAsync(client, root);
 
 		List<GraphEdge> edges = db.GetGraphEdges(root.Id); // oldest → newest
+		List<(ulong Id, string? Name)> movedAuthors = [];
 		foreach (GraphEdge edge in edges)
 		{
+			// An edge whose message already has a transposed copy (a crash landed between
+			// the repost and the edge deletion on a previous sweep) must never be
+			// reposted again — just finish the delete-and-forget half.
+			if (db.GetTransposedThread(edge.MessageId) is not null)
+			{
+				try
+				{
+					DiscordMessage stale = await channel.GetMessageAsync(edge.MessageId);
+					await stale.DeleteAsync("ThreadTender: already transposed");
+				}
+				catch (NotFoundException) { }
+				db.DeleteGraphEdge(edge.MessageId);
+				continue;
+			}
+
 			DiscordMessage message;
 			try
 			{
-				message = await channel.GetMessageAsync(edge.MessageId);
+				// skipCache: the cached copy is a snapshot from when the message arrived —
+				// reactions added (and edits made) since then only exist on the REST copy.
+				message = await channel.GetMessageAsync(edge.MessageId, skipCache: true);
 			}
 			catch (NotFoundException)
 			{
@@ -158,9 +193,11 @@ public class FlexThreader(BotConfig config, Database db, Transposer transposer, 
 				continue;
 			}
 
-			// Pseudo-reply headers and (for debug users) masquerade prefixes were part of
-			// the in-channel presentation; neither belongs in the swept copy.
+			// Pseudo-reply headers, bot-relay "@user:" lines, and (for debug users)
+			// masquerade prefixes were part of the in-channel presentation; none of them
+			// belong in the swept copy — the repost re-adds its own presentation.
 			string? contentOverride = Transposer.StripReplyHeader(message.Content);
+			contentOverride = Transposer.StripAuthorTag(contentOverride, edge.AuthorId, edge.AuthorName);
 			if (message.Author is not null && config.IsDebugUser(message.Author.Id))
 				contentOverride = Masquerade.StripPrefix(contentOverride);
 
@@ -173,10 +210,28 @@ public class FlexThreader(BotConfig config, Database db, Transposer transposer, 
 				// Same invariant as everywhere else: repost first, delete only once the
 				// copy exists. A crash mid-sweep leaves the mapping unset, so the next
 				// comment's RecordCommentAsync re-runs the sweep and moves the remainder.
-				await transposer.RepostAsync(client, thread, content, edge.MessageId);
+				// The sweep re-presents a conversation that already happened, so webhook
+				// impersonation keeps it reading naturally; live transpositions elsewhere
+				// use the bot relay instead.
+				DiscordMessage copy = await transposer.RepostAsync(client, thread, content, edge.MessageId, RepostStyle.Webhook);
+
+				// Reactions can't be transposed, but the bot can echo each emoji on the
+				// copy — an invitation for people to re-react. Decoration only: an emoji
+				// the bot can't use (external server) is silently skipped.
+				if (message.Reactions is { Count: > 0 })
+				{
+					foreach (DiscordReaction reaction in message.Reactions)
+					{
+						try { await copy.CreateReactionAsync(reaction.Emoji); }
+						catch (Exception) { }
+					}
+				}
+
 				try { await message.DeleteAsync("ThreadTender: reply graph moved to thread"); }
 				catch (NotFoundException) { }
 				db.DeleteGraphEdge(edge.MessageId);
+				if (!movedAuthors.Any(a => a.Id == edge.AuthorId))
+					movedAuthors.Add((edge.AuthorId, edge.AuthorName.Length > 0 ? edge.AuthorName : null));
 			}
 			finally
 			{
@@ -189,5 +244,15 @@ public class FlexThreader(BotConfig config, Database db, Transposer transposer, 
 		}
 
 		db.SetFlexThread(root.Id, thread.Id);
+
+		if (movedAuthors.Count > 0)
+		{
+			// One mass ping so everyone whose messages just moved knows where the
+			// conversation went; synthetic debug identities render as plain text.
+			string tags = string.Join(" ", movedAuthors.Select(a => a.Name is not null ? $"**{a.Name}**" : $"<@{a.Id}>"));
+			await thread.SendMessageAsync(new DiscordMessageBuilder()
+				.WithContent($"{tags} — created discussion thread")
+				.WithAllowedMentions(movedAuthors.Where(a => a.Name is null).Select(a => (IMention)new UserMention(a.Id)).ToList()));
+		}
 	}
 }

@@ -13,10 +13,13 @@ Every managed channel runs in one of three modes, chosen when you `/bind` it:
   **their own** post is treated as content continuation and left alone.
 - **Any other reply** (whitelisted or not) is deleted and transposed into the target
   post's thread — created on the fly if it doesn't exist yet, unarchived if it fell
-  asleep. The repost is done through a webhook wearing the original author's display name
-  and avatar, so the thread reads naturally.
-  Reply chains are walked to their root, so replying to a self-reply continuation still
-  lands in the root post's thread.
+  asleep. The bot reposts it under its own identity as `@user:` followed by the text —
+  a live transposition is the bot acting on someone's message, and it says so.
+  Reply chains are walked up to the nearest whitelisted author's *top-level* post — a
+  non-reply, or a self-reply continuation (which is a top-level post in its own right,
+  so discussion under it gets its own thread rather than being folded into the chain's
+  oldest ancestor). An author's reply to someone else's comment is ordinary discussion:
+  it's walked through, counted, and swept like anyone else's.
 - **A non-reply comment from a non-whitelisted user** is deleted and held, and the bot
   asks (in-channel, buttons visible to everyone but usable only by the commenter) which
   post they meant to reply to:
@@ -34,17 +37,25 @@ Every managed channel runs in one of three modes, chosen when you `/bind` it:
 Only one rule: comments from non-whitelisted users must be **replies**. Replies of any
 kind are left untouched. A non-reply comment gets the same "which post did you mean?"
 flow as pure mode, but resolution puts the comment back **in the channel** as a
-pseudo-reply: a webhook repost under the commenter's name whose first line links the
-target post (webhooks cannot create real Discord replies, so the link header stands in
-for the reply reference).
+pseudo-reply: a bot repost (`@user:` + text) whose first line links the target post
+(bots cannot create reply references on behalf of someone else, so the link header
+stands in for it).
 
 ### Flex-Thread-Enforcement
 
 Reply-Enforcement, plus a pressure valve: each top-level post's reply graph (direct
-replies, replies to replies, and pseudo-replies from the orphan flow) may accumulate up
-to `flex_threshold` comments (default 5) in the channel. The comment that exceeds the
-threshold triggers a sweep — a thread is created on the root post and the **entire
-graph** is transposed into it, oldest first.
+replies, replies to replies, and pseudo-replies from the orphan flow) may accumulate in
+the channel until it reaches **either** flex threshold: a message count (default 5) or
+a total-line count, where every message is at least one line and each ~60 characters
+of text adds another — so five short quips and one wall of text weigh comparably
+(line threshold 0, the default, disables the line check entirely). The comment that reaches a threshold triggers the sweep (the
+5th comment sweeps at a threshold of 5) — a thread is created on the root post and the **entire
+graph** is transposed into it, oldest first. The sweep reposts through webhooks wearing
+each original author's name and avatar (it re-presents a conversation that already
+happened, so it should read naturally) and ends with one mass ping — "*@a @b — created
+discussion thread*" — so everyone whose messages moved knows where they went. Emoji
+reactions can't be transposed, but the bot echoes each reaction emoji onto the moved
+copy as an invitation to re-react (external emojis it can't use are skipped).
 From then on that post behaves like pure mode: further replies to it (or to
 any moved comment) are auto-transposed into its thread. Whitelisted authors'
 self-reply continuations are exempt as usual — never counted, never swept.
@@ -67,8 +78,9 @@ still routes to the right thread.
    View Channel, Send Messages, Send Messages in Threads, Create Public Threads,
    Manage Messages, Manage Threads, Manage Webhooks, Read Message History (the bot
    scans recent posts for the orphan prompt and fetches reply targets), Attach Files
-   (returning held attachments in-channel when DMs are closed).
-   (Permission integer: `326954494976`.)
+   (returning held attachments in-channel when DMs are closed), Add Reactions
+   (echoing a swept message's reactions onto its copy).
+   (Permission integer: `326954495040`.)
 
 ### 2. Configuration
 
@@ -106,12 +118,11 @@ takes precedence.
 
 - **/bind** — setup wizard: pick a channel, pick a mode (each explained in the menu),
   pick the whitelisted author(s). Running it on an already-bound channel drops you into
-  the edit menu instead.
+  the edit menu instead: switch mode, replace the whitelist (prefilled with the current
+  one), or set the flex threshold.
 - **/unbind** — pick a bound channel, confirm, done. Pending "which post?" prompts in
   that channel are cancelled and their content returned to the authors; existing
   threads and moved messages stay where they are.
-- **/bindsettings** — edit an existing binding: switch mode, replace the whitelist
-  (prefilled with the current one), or set the flex threshold.
 - **/botsettings** — view and edit the global knobs: orphan timeout, thread name max
   length, max attachment size, search depth, fuzzy threshold, and the debug masquerade
   user list.

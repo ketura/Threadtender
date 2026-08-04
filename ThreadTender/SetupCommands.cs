@@ -6,7 +6,7 @@ namespace ThreadTender;
 
 /// <summary>
 /// Guild-admin slash commands for configuring the bot from inside Discord:
-/// /bind (setup wizard), /unbind (confirm-guarded removal), /bindsettings (edit an
+/// /bind (setup wizard, doubling as the edit menu for bound channels), /unbind (an
 /// existing binding), /botsettings (global knobs). All flows are ephemeral,
 /// component-driven, and stateless — wizard state rides in the component custom IDs
 /// (prefixes: ttb = bind wizard, tte = edit binding, ttu = unbind, ttg = globals).
@@ -21,9 +21,8 @@ public class SetupCommands(BotConfig config, Database db, OrphanManager orphans,
 	{
 		DiscordApplicationCommand[] commands =
 		[
-			Command("bind", "Set up ThreadTender on a channel (walks you through mode and whitelist)."),
+			Command("bind", "Set up ThreadTender on a channel, or edit an existing binding."),
 			Command("unbind", "Remove ThreadTender from a channel."),
-			Command("bindsettings", "Edit an existing channel binding (mode, whitelist, flex threshold)."),
 			Command("botsettings", "View and edit global ThreadTender settings."),
 		];
 
@@ -59,11 +58,6 @@ public class SetupCommands(BotConfig config, Database db, OrphanManager orphans,
 			case "unbind":
 				await RespondAsync(interaction, BuildChannelPickOrEmpty(interaction, "ttu:pick",
 					"Which channel should I stop managing?", "No channels are currently bound — nothing to unbind."));
-				break;
-
-			case "bindsettings":
-				await RespondAsync(interaction, BuildChannelPickOrEmpty(interaction, "tte:pick",
-					"Which binding do you want to edit?", "No channels are currently bound — use /bind first."));
 				break;
 
 			case "botsettings":
@@ -122,9 +116,7 @@ public class SetupCommands(BotConfig config, Database db, OrphanManager orphans,
 	public async Task HandleModalAsync(DiscordClient client, ModalSubmittedEventArgs e)
 	{
 		string[] parts = e.Id.Split(':');
-		string value = e.Values.TryGetValue("value", out IModalSubmission? submission) && submission is TextInputModalSubmission text
-			? (text.Value ?? "").Trim()
-			: "";
+		string value = ModalValue(e, "value");
 
 		if (parts is ["tte", "flexmod", var channelIdText])
 		{
@@ -135,13 +127,20 @@ public class SetupCommands(BotConfig config, Database db, OrphanManager orphans,
 				await UpdateAsync(e.Interaction, Ending("That binding no longer exists."));
 				return;
 			}
-			if (!int.TryParse(value, out int threshold) || threshold is < 1 or > 100)
+			if (!int.TryParse(ModalValue(e, "messages"), out int messages) || messages is < 1 or > 100)
 			{
-				await UpdateAsync(e.Interaction, Ending("The flex threshold needs to be a whole number between 1 and 100 — run /bindsettings to try again."));
+				await UpdateAsync(e.Interaction, Ending("The message threshold needs to be a whole number between 1 and 100 — run /bind on the channel to try again."));
 				return;
 			}
-			config.SetBinding(binding with { FlexThreshold = threshold });
-			await UpdateAsync(e.Interaction, Ending($"✅ Flex threshold for <#{channelId}> is now **{threshold}**."));
+			if (!int.TryParse(ModalValue(e, "lines"), out int lines) || lines is < 0 or > 1000)
+			{
+				await UpdateAsync(e.Interaction, Ending("The line threshold needs to be a whole number between 0 and 1000 (0 = ignore lines) — run /bind on the channel to try again."));
+				return;
+			}
+			config.SetBinding(binding with { FlexThreshold = messages, FlexLineThreshold = lines });
+			await UpdateAsync(e.Interaction, Ending(
+				$"✅ Flex thresholds for <#{channelId}>: **{messages}** messages, " +
+				(lines > 0 ? $"**{lines}** lines (~60 chars each)." : "line check **off**.")));
 			return;
 		}
 
@@ -155,6 +154,11 @@ public class SetupCommands(BotConfig config, Database db, OrphanManager orphans,
 	/// <summary>A flow-ending response: content only, all components cleared.</summary>
 	private static DiscordInteractionResponseBuilder Ending(string content) =>
 		new DiscordInteractionResponseBuilder().WithContent(content);
+
+	private static string ModalValue(ModalSubmittedEventArgs e, string key) =>
+		e.Values.TryGetValue(key, out IModalSubmission? submission) && submission is TextInputModalSubmission text
+			? (text.Value ?? "").Trim()
+			: "";
 
 	// ---------------------------------------------------------------- /bind wizard
 
@@ -219,7 +223,7 @@ public class SetupCommands(BotConfig config, Database db, OrphanManager orphans,
 				string summary = $"✅ **<#{channelId}>** is now managed with **{mode.DisplayName()}**.\n" +
 					$"Whitelisted author(s): {string.Join(", ", whitelist.Select(id => $"<@{id}>"))}";
 				if (mode == ChannelMode.FlexThread)
-					summary += "\nFlex threshold: **5** (change it with /bindsettings).";
+					summary += "\nFlex thresholds: **5** messages, line check **off** (change them by running /bind on the channel again).";
 				await UpdateAsync(e.Interaction, Ending(summary));
 				await BackfillAfterResponseAsync(client, channelId);
 				return;
@@ -230,7 +234,7 @@ public class SetupCommands(BotConfig config, Database db, OrphanManager orphans,
 	private static DiscordSelectComponent ModeSelect(string customId) => new(customId, "Choose a mode…",
 		AllModes.Select(m => new DiscordSelectComponentOption(m.DisplayName(), m.ToConfigString(), m.Description())).ToList());
 
-	// ---------------------------------------------------------------- /bindsettings (and /bind on a bound channel)
+	// ---------------------------------------------------------------- editing (via /bind on an already-bound channel)
 
 	private DiscordInteractionResponseBuilder BuildEditMenu(ChannelBinding binding)
 	{
@@ -239,7 +243,8 @@ public class SetupCommands(BotConfig config, Database db, OrphanManager orphans,
 		[
 			new("Switch mode", "mode", $"Currently {binding.Mode.DisplayName()}"),
 			new("Edit whitelist", "wl", "Replaces the current whitelist outright"),
-			new("Set flex threshold", "flex", $"Currently {binding.FlexThreshold} — only used by Flex mode"),
+			new("Set flex thresholds", "flex",
+				$"Currently {binding.FlexThreshold} msgs / {(binding.FlexLineThreshold > 0 ? $"{binding.FlexLineThreshold} lines" : "lines off")} — Flex mode only"),
 		];
 		return new DiscordInteractionResponseBuilder()
 			.WithContent(
@@ -252,13 +257,6 @@ public class SetupCommands(BotConfig config, Database db, OrphanManager orphans,
 	{
 		switch (parts)
 		{
-			case ["tte", "pick"]:
-			{
-				ChannelBinding? binding = config.GetBinding(ulong.Parse(e.Values[0]));
-				await UpdateAsync(e.Interaction, binding is null ? Ending("That binding no longer exists.") : BuildEditMenu(binding));
-				return;
-			}
-
 			case ["tte", "menu", var channelIdText]:
 			{
 				ulong channelId = ulong.Parse(channelIdText);
@@ -289,11 +287,14 @@ public class SetupCommands(BotConfig config, Database db, OrphanManager orphans,
 
 					case "flex":
 						DiscordModalBuilder modal = new DiscordModalBuilder()
-							.WithTitle("Flex threshold")
+							.WithTitle("Flex thresholds")
 							.WithCustomId($"tte:flexmod:{channelId}")
 							.AddTextInput(
-								new DiscordTextInputComponent("value", $"currently {binding.FlexThreshold}"),
-								"Comments before auto-thread", "How many comments a post's reply graph may hold before it's swept into a thread (1–100).");
+								new DiscordTextInputComponent("messages", value: binding.FlexThreshold.ToString()),
+								"Message threshold", "Comments a post's reply graph may hold before it's swept into a thread (1–100).")
+							.AddTextInput(
+								new DiscordTextInputComponent("lines", value: binding.FlexLineThreshold.ToString()),
+								"Line threshold (0 = ignore lines)", "Total text lines (~60 chars each) the graph may hold before it's swept (0–1000).");
 						await e.Interaction.CreateResponseAsync(DiscordInteractionResponseType.Modal, modal);
 						return;
 				}

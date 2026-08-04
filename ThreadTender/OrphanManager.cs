@@ -302,7 +302,7 @@ public class OrphanManager(BotConfig config, Database db, Transposer transposer,
 				case ChannelMode.PureThread:
 				{
 					DiscordThreadChannel thread = await transposer.GetOrCreateThreadAsync(client, root);
-					await transposer.RepostAsync(client, thread, RehydrateContent(pending), pending.MessageId);
+					await transposer.RepostAsync(client, thread, RehydrateContent(pending), pending.MessageId, RepostStyle.Bot);
 					await CleanupAsync(client, pending, deletePrompt: true);
 					await NotifyAsync(interaction, $"✅ Moved to {thread.Mention}.", editOriginal);
 					break;
@@ -323,7 +323,7 @@ public class OrphanManager(BotConfig config, Database db, Transposer transposer,
 					DiscordThreadChannel? existing = threadId is null ? null : await TryGetThreadAsync(client, threadId.Value);
 					if (existing is not null)
 					{
-						await transposer.RepostAsync(client, existing, RehydrateContent(pending), pending.MessageId);
+						await transposer.RepostAsync(client, existing, RehydrateContent(pending), pending.MessageId, RepostStyle.Bot);
 						await CleanupAsync(client, pending, deletePrompt: true);
 						await NotifyAsync(interaction, $"✅ Moved to {existing.Mention}.", editOriginal);
 						break;
@@ -339,7 +339,7 @@ public class OrphanManager(BotConfig config, Database db, Transposer transposer,
 					// surface as "something went wrong" — the edge is recorded before the
 					// sweep runs, and the next comment on this root will retry it.
 					EffectiveAuthor author = new(pending.AuthorId, pending.AuthorName.Length > 0 ? pending.AuthorName : null);
-					try { await flex.RecordCommentAsync(client, binding, channel, repostId, author, root); }
+					try { await flex.RecordCommentAsync(client, binding, channel, repostId, FlexThreader.LinesOf(pending.Content), author, root); }
 					catch (Exception) { }
 					break;
 				}

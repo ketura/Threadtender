@@ -50,8 +50,30 @@ public static class ChannelModes
 	};
 }
 
-/// <summary>A channel's enforcement configuration. One binding per channel, stored in SQLite.</summary>
-public record ChannelBinding(ulong ChannelId, ulong GuildId, ChannelMode Mode, List<ulong> Whitelist, int FlexThreshold);
+/// <summary>
+/// How a repost is presented. Not configured per binding — the CONTEXT picks: the flex
+/// sweep re-presents an existing conversation and uses webhook impersonation so it
+/// reads naturally; every live transposition (a reply moved after its thread exists, an
+/// orphan resolution) is the bot acting on someone's message right now, and posts
+/// honestly as the bot with an "@user:" header.
+/// </summary>
+public enum RepostStyle
+{
+	/// <summary>Reposts go through a webhook wearing the original author's name and avatar.</summary>
+	Webhook,
+	/// <summary>The bot posts under its own identity, prefixed "@user:".</summary>
+	Bot,
+}
+
+/// <summary>
+/// A channel's enforcement configuration. One binding per channel, stored in SQLite.
+/// Flex mode sweeps a post's reply graph into a thread when EITHER threshold is
+/// reached: <paramref name="FlexThreshold"/> counts messages, and
+/// <paramref name="FlexLineThreshold"/> counts total text lines (one line ≈ 60
+/// characters, so five short quips and one wall of text are weighted alike;
+/// 0 = ignore lines, use only the message count).
+/// </summary>
+public record ChannelBinding(ulong ChannelId, ulong GuildId, ChannelMode Mode, List<ulong> Whitelist, int FlexThreshold, int FlexLineThreshold = 0);
 
 /// <summary>
 /// Runtime configuration. The settings file carries ONLY the bot token (overridable via

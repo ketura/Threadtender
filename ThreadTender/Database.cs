@@ -54,7 +54,8 @@ public class Database : IDisposable
 				root_id INTEGER NOT NULL,
 				channel_id INTEGER NOT NULL,
 				author_id INTEGER NOT NULL,
-				author_name TEXT NOT NULL DEFAULT ''
+				author_name TEXT NOT NULL DEFAULT '',
+				line_count INTEGER NOT NULL DEFAULT 0
 			);
 			CREATE INDEX IF NOT EXISTS idx_graph_edges_root ON graph_edges(root_id);
 			CREATE TABLE IF NOT EXISTS flex_threads (
@@ -66,7 +67,8 @@ public class Database : IDisposable
 				guild_id INTEGER NOT NULL,
 				mode TEXT NOT NULL,
 				whitelist TEXT NOT NULL DEFAULT '',
-				flex_threshold INTEGER NOT NULL DEFAULT 5
+				flex_threshold INTEGER NOT NULL DEFAULT 5,
+				flex_line_threshold INTEGER NOT NULL DEFAULT 0
 			);
 			CREATE TABLE IF NOT EXISTS settings (
 				key TEXT PRIMARY KEY,
@@ -76,6 +78,15 @@ public class Database : IDisposable
 
 		// pending_orphans.author_name postdates the first release; graft it onto older DBs.
 		try { Execute("ALTER TABLE pending_orphans ADD COLUMN author_name TEXT NOT NULL DEFAULT ''"); }
+		catch (SqliteException) { /* column already exists */ }
+
+		// (A short-lived bindings.repost_style column may exist in DBs from early builds;
+		// it is simply ignored — repost style is contextual now, not configured.)
+
+		// Dual flex thresholds postdate the original tables; graft onto older DBs.
+		try { Execute("ALTER TABLE bindings ADD COLUMN flex_line_threshold INTEGER NOT NULL DEFAULT 0"); }
+		catch (SqliteException) { /* column already exists */ }
+		try { Execute("ALTER TABLE graph_edges ADD COLUMN line_count INTEGER NOT NULL DEFAULT 0"); }
 		catch (SqliteException) { /* column already exists */ }
 	}
 
@@ -151,14 +162,14 @@ public class Database : IDisposable
 
 	// ---------------------------------------------------------------- flex reply graphs
 
-	public void AddGraphEdge(ulong messageId, ulong rootId, ulong channelId, ulong authorId, string authorName) => Execute(
+	public void AddGraphEdge(ulong messageId, ulong rootId, ulong channelId, ulong authorId, string authorName, int lineCount) => Execute(
 		"""
-		INSERT INTO graph_edges (message_id, root_id, channel_id, author_id, author_name)
-		VALUES ($mid, $rid, $cid, $aid, $aname)
+		INSERT INTO graph_edges (message_id, root_id, channel_id, author_id, author_name, line_count)
+		VALUES ($mid, $rid, $cid, $aid, $aname, $lines)
 		ON CONFLICT(message_id) DO NOTHING
 		""",
 		("$mid", (long)messageId), ("$rid", (long)rootId), ("$cid", (long)channelId),
-		("$aid", (long)authorId), ("$aname", authorName));
+		("$aid", (long)authorId), ("$aname", authorName), ("$lines", lineCount));
 
 	public void DeleteGraphEdge(ulong messageId) =>
 		Execute("DELETE FROM graph_edges WHERE message_id = $mid", ("$mid", (long)messageId));
@@ -190,14 +201,17 @@ public class Database : IDisposable
 		}
 	}
 
-	public int CountGraph(ulong rootId)
+	/// <summary>Message count and total line count recorded against a root's reply graph.</summary>
+	public (int Messages, int Lines) GetGraphStats(ulong rootId)
 	{
 		lock (gate)
 		{
 			using SqliteCommand cmd = connection.CreateCommand();
-			cmd.CommandText = "SELECT COUNT(*) FROM graph_edges WHERE root_id = $rid";
+			cmd.CommandText = "SELECT COUNT(*), COALESCE(SUM(line_count), 0) FROM graph_edges WHERE root_id = $rid";
 			cmd.Parameters.AddWithValue("$rid", (long)rootId);
-			return Convert.ToInt32(cmd.ExecuteScalar());
+			using SqliteDataReader reader = cmd.ExecuteReader();
+			reader.Read();
+			return (reader.GetInt32(0), reader.GetInt32(1));
 		}
 	}
 
@@ -242,12 +256,12 @@ public class Database : IDisposable
 
 	public void UpsertBinding(ChannelBinding b) => Execute(
 		"""
-		INSERT INTO bindings (channel_id, guild_id, mode, whitelist, flex_threshold)
-		VALUES ($cid, $gid, $mode, $wl, $flex)
-		ON CONFLICT(channel_id) DO UPDATE SET guild_id = $gid, mode = $mode, whitelist = $wl, flex_threshold = $flex
+		INSERT INTO bindings (channel_id, guild_id, mode, whitelist, flex_threshold, flex_line_threshold)
+		VALUES ($cid, $gid, $mode, $wl, $flex, $flexLines)
+		ON CONFLICT(channel_id) DO UPDATE SET guild_id = $gid, mode = $mode, whitelist = $wl, flex_threshold = $flex, flex_line_threshold = $flexLines
 		""",
 		("$cid", (long)b.ChannelId), ("$gid", (long)b.GuildId), ("$mode", b.Mode.ToConfigString()),
-		("$wl", string.Join(",", b.Whitelist)), ("$flex", b.FlexThreshold));
+		("$wl", string.Join(",", b.Whitelist)), ("$flex", b.FlexThreshold), ("$flexLines", b.FlexLineThreshold));
 
 	public void DeleteBinding(ulong channelId) =>
 		Execute("DELETE FROM bindings WHERE channel_id = $cid", ("$cid", (long)channelId));
@@ -257,7 +271,7 @@ public class Database : IDisposable
 		lock (gate)
 		{
 			using SqliteCommand cmd = connection.CreateCommand();
-			cmd.CommandText = "SELECT channel_id, guild_id, mode, whitelist, flex_threshold FROM bindings";
+			cmd.CommandText = "SELECT channel_id, guild_id, mode, whitelist, flex_threshold, flex_line_threshold FROM bindings";
 			using SqliteDataReader reader = cmd.ExecuteReader();
 			List<ChannelBinding> result = [];
 			while (reader.Read())
@@ -267,7 +281,7 @@ public class Database : IDisposable
 					.Select(ulong.Parse).ToList();
 				result.Add(new ChannelBinding(
 					(ulong)reader.GetInt64(0), (ulong)reader.GetInt64(1),
-					ChannelModes.Parse(reader.GetString(2)), whitelist, reader.GetInt32(4)));
+					ChannelModes.Parse(reader.GetString(2)), whitelist, reader.GetInt32(4), reader.GetInt32(5)));
 			}
 			return result;
 		}

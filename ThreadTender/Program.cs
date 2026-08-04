@@ -6,6 +6,28 @@ using ThreadTender;
 string dataDir = Path.GetFullPath(Environment.GetEnvironmentVariable("DATA_DIR") ?? "data");
 Directory.CreateDirectory(dataDir);
 
+// Two instances against the same data dir double every transposition (each process
+// reacts to every gateway event, racing past the shared dedup tables). Refuse to start.
+// The lock releases automatically when the process dies, even ungracefully.
+using FileStream instanceLock = AcquireInstanceLock(dataDir);
+
+static FileStream AcquireInstanceLock(string dataDir)
+{
+	try
+	{
+		return new FileStream(Path.Combine(dataDir, ".instance.lock"),
+			FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+	}
+	catch (IOException)
+	{
+		Console.Error.WriteLine(
+			$"[ThreadTender] Another instance is already running against {dataDir} — " +
+			"a second bot would double-post every transposition. Exiting.");
+		Environment.Exit(1);
+		throw; // unreachable
+	}
+}
+
 // The build copies the repo-root settings.json into <output>/data. When the active data
 // dir has no config yet (`dotnet run` resolves ./data against the project dir, not the
 // output dir), seed it from that baked copy instead of dying with the sample-file error.

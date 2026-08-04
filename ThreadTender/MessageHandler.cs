@@ -85,7 +85,8 @@ public class MessageHandler(BotConfig config, Database db, Transposer transposer
 		if (config.IsWhitelisted(message.ChannelId, author.Id) && target.Author.Id == author.Id)
 			return;
 
-		DiscordMessage anchor = await Transposer.WalkToRootAsync(target);
+		DiscordMessage anchor = await Transposer.WalkToRootAsync(target,
+			m => config.IsWhitelisted(message.ChannelId, m.Author?.Id ?? 0));
 		DiscordThreadChannel thread;
 		try
 		{
@@ -162,9 +163,10 @@ public class MessageHandler(BotConfig config, Database db, Transposer transposer
 			}
 		}
 
-		// Below the threshold the reply simply stays in the channel; it just gets
+		// Below the thresholds the reply simply stays in the channel; it just gets
 		// counted (and may trip the sweep that moves it, and everything else, out).
-		await flex.RecordCommentAsync(client, binding, message.Channel!, message.Id, author, root);
+		await flex.RecordCommentAsync(client, binding, message.Channel!, message.Id,
+			FlexThreader.LinesOf(contentOverride ?? message.Content), author, root);
 	}
 
 	/// <summary>
@@ -206,7 +208,9 @@ public class MessageHandler(BotConfig config, Database db, Transposer transposer
 			// Repost FIRST, delete only once the copy exists — a failed repost then
 			// leaves the original untouched instead of destroying it. The brief
 			// double-existence is the price of never losing a user's message.
-			await transposer.RepostAsync(client, thread, content, message.Id);
+			// Live transposition = bot relay: the bot is acting on someone's message
+			// right now and says so, rather than impersonating them.
+			await transposer.RepostAsync(client, thread, content, message.Id, RepostStyle.Bot);
 			try { await message.DeleteAsync("ThreadTender: reply moved to thread"); }
 			catch (NotFoundException) { } // already gone; the copy exists either way
 		}

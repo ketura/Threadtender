@@ -16,24 +16,34 @@ public class Transposer(BotConfig config, Database db)
 	private readonly ConcurrentDictionary<ulong, DiscordWebhook> webhookCache = new();
 	private readonly ConcurrentDictionary<ulong, SemaphoreSlim> anchorLocks = new();
 
-	/// <summary>Walks a reply chain up to its top-level root message.</summary>
-	public static async Task<DiscordMessage> WalkToRootAsync(DiscordMessage message)
+	/// <summary>
+	/// Walks a reply chain toward its root, stopping at the nearest message that counts
+	/// as a whitelisted author's TOP-LEVEL post: a non-reply, or a reply to the author's
+	/// own message (a self-reply "continuation" is a top-level post in its own right,
+	/// often a deliberate link to an earlier post). An author's reply to someone ELSE is
+	/// ordinary discussion and gets walked through like anyone else's comment.
+	/// </summary>
+	public static async Task<DiscordMessage> WalkToRootAsync(DiscordMessage message, Func<DiscordMessage, bool> isWhitelistedAuthor)
 	{
-		// Whitelisted authors build long top-level self-reply chains by design, and a cap
-		// that's too low would anchor threads mid-chain, fragmenting discussion. 50 is a
-		// backstop against reference cycles, not an expected length.
+		// The 50-hop cap is a backstop against reference cycles, not an expected length.
 		DiscordMessage current = message;
 		for (int depth = 0; depth < 50 && current.MessageType == DiscordMessageType.Reply; depth++)
 		{
-			DiscordMessage? referenced = current.ReferencedMessage;
-			if (referenced is null && current.Reference?.Message is not null)
+			// Resolve the parent first — whether a whitelisted author's reply is a root
+			// depends on WHO it answers (self = continuation; anyone else = discussion).
+			DiscordMessage? parent = current.ReferencedMessage;
+			if (parent is null && current.Reference?.Message is not null)
 			{
-				try { referenced = await current.Channel!.GetMessageAsync(current.Reference.Message.Id); }
+				try { parent = await current.Channel!.GetMessageAsync(current.Reference.Message.Id); }
 				catch (NotFoundException) { break; }
 			}
-			if (referenced is null)
+			if (parent is null)
 				break;
-			current = referenced;
+
+			if (isWhitelistedAuthor(current) && current.Author is not null && parent.Author?.Id == current.Author.Id)
+				break; // self-reply continuation: current IS the top-level post
+
+			current = parent;
 		}
 		return current;
 	}
@@ -91,12 +101,22 @@ public class Transposer(BotConfig config, Database db)
 	/// Reposts captured content into the given thread as its original author (webhook
 	/// impersonation) and records the mapping.
 	/// </summary>
-	public async Task RepostAsync(DiscordClient client, DiscordThreadChannel thread, MovableContent content, ulong originalMessageId)
+	/// <returns>The first message of the reposted copy (callers may decorate it, e.g. reaction echoes).</returns>
+	public async Task<DiscordMessage> RepostAsync(DiscordClient client, DiscordThreadChannel thread, MovableContent content, ulong originalMessageId, RepostStyle style)
 	{
 		// Callers can arrive here with a mapped thread that bypassed GetOrCreateThreadAsync,
 		// and webhooks cannot post into archived threads — so unarchive defensively.
 		if (thread.ThreadMetadata?.IsArchived == true)
 			await thread.ModifyAsync(m => m.IsArchived = false);
+
+		// Bot-relay style: the bot posts under its own identity with an "@user:" header
+		// instead of impersonating via webhook.
+		if (style == RepostStyle.Bot)
+		{
+			DiscordMessage botFirst = await SendAsBotAsync(b => thread.SendMessageAsync(b), content, header: null);
+			db.RecordTransposed(originalMessageId, thread.Id);
+			return botFirst;
+		}
 
 		DiscordChannel parent = await client.GetChannelAsync(thread.ParentId
 			?? throw new InvalidOperationException($"Thread {thread.Id} has no parent"));
@@ -105,17 +125,17 @@ public class Transposer(BotConfig config, Database db)
 		DiscordWebhook webhook = await GetOrCreateWebhookAsync(parent);
 
 		// Retries once with a fresh webhook if the cached one was deleted out from under us.
-		async Task ExecuteResilientAsync(DiscordWebhookBuilder b)
+		async Task<DiscordMessage> ExecuteResilientAsync(DiscordWebhookBuilder b)
 		{
 			try
 			{
-				await webhook.ExecuteAsync(b);
+				return await webhook.ExecuteAsync(b);
 			}
 			catch (NotFoundException)
 			{
 				webhookCache.TryRemove(parent.Id, out _);
 				webhook = await GetOrCreateWebhookAsync(parent);
-				await webhook.ExecuteAsync(b);
+				return await webhook.ExecuteAsync(b);
 			}
 		}
 
@@ -147,6 +167,7 @@ public class Transposer(BotConfig config, Database db)
 		if (chunks.Count > 0)
 			builder.WithContent(chunks[0]);
 
+		DiscordMessage first;
 		List<FileStream> streams = [];
 		try
 		{
@@ -156,7 +177,7 @@ public class Transposer(BotConfig config, Database db)
 				streams.Add(stream);
 				builder.AddFile(name, stream);
 			}
-			await ExecuteResilientAsync(builder);
+			first = await ExecuteResilientAsync(builder);
 		}
 		finally
 		{
@@ -168,6 +189,7 @@ public class Transposer(BotConfig config, Database db)
 			await ExecuteResilientAsync(NewBuilder().WithContent(chunk));
 
 		db.RecordTransposed(originalMessageId, thread.Id);
+		return first;
 	}
 
 	/// <summary>
@@ -176,8 +198,15 @@ public class Transposer(BotConfig config, Database db)
 	/// so a subtext header links the target instead. Returns the reposted message's ID
 	/// (the first chunk's, when chunked) so callers can record it as a graph member.
 	/// </summary>
-	public async Task<ulong> RepostToChannelAsync(DiscordClient client, DiscordChannel channel, MovableContent content, ulong originalMessageId, DiscordMessage replyTarget)
+	public async Task<ulong> RepostToChannelAsync(DiscordClient client, DiscordChannel channel, MovableContent content, ulong originalMessageId, DiscordMessage replyTarget, RepostStyle style = RepostStyle.Bot)
 	{
+		if (style == RepostStyle.Bot)
+		{
+			DiscordMessage botFirst = await SendAsBotAsync(b => channel.SendMessageAsync(b), content, ReplyHeaderFor(replyTarget));
+			db.RecordTransposed(originalMessageId, 0);
+			return botFirst.Id;
+		}
+
 		(string displayName, string? avatarUrl) = await ResolveIdentityAsync(client, channel.Guild, content);
 		DiscordWebhook webhook = await GetOrCreateWebhookAsync(channel);
 
@@ -237,6 +266,68 @@ public class Transposer(BotConfig config, Database db)
 		// re-intercepting a message we already handled.
 		db.RecordTransposed(originalMessageId, 0);
 		return first.Id;
+	}
+
+	/// <summary>The "@user:" line a bot-relay repost opens with (bold name for synthetic debug identities).</summary>
+	private static string AuthorTagFor(MovableContent content) =>
+		content.AuthorName is not null ? $"**{content.AuthorName}**:" : $"<@{content.AuthorId}>:";
+
+	/// <summary>
+	/// Bot-relay repost: the bot posts as itself — optional pseudo-reply header, then
+	/// "@user:", then the content. Mentions render but never ping (suppressed), matching
+	/// the webhook path's no-re-ping behavior. Returns the first message sent.
+	/// </summary>
+	private static async Task<DiscordMessage> SendAsBotAsync(Func<DiscordMessageBuilder, Task<DiscordMessage>> send, MovableContent content, string? header)
+	{
+		string text = AuthorTagFor(content);
+		if (header is not null)
+			text = $"{header}\n{text}";
+		if (content.Content.Length > 0)
+			text += $"\n{content.Content}";
+		if (content.Notes.Length > 0)
+			text += $"\n{content.Notes}";
+
+		List<string> chunks = Chunk(text, 2000); // never empty: the author tag is always present
+
+		DiscordMessageBuilder first = new DiscordMessageBuilder().WithContent(chunks[0]).WithAllowedMentions([]);
+		DiscordMessage firstMessage;
+		List<FileStream> streams = [];
+		try
+		{
+			foreach ((string name, string path) in content.Files)
+			{
+				FileStream stream = File.OpenRead(path);
+				streams.Add(stream);
+				first.AddFile(name, stream);
+			}
+			firstMessage = await send(first);
+		}
+		finally
+		{
+			foreach (FileStream stream in streams)
+				await stream.DisposeAsync();
+		}
+
+		foreach (string chunk in chunks.Skip(1))
+			await send(new DiscordMessageBuilder().WithContent(chunk).WithAllowedMentions([]));
+
+		return firstMessage;
+	}
+
+	/// <summary>
+	/// Strips the "@user:" line a bot-relay repost added, so re-transposition (the flex
+	/// sweep) doesn't stack a second header on top. No-op when the prefix isn't there
+	/// (webhook reposts, ordinary messages).
+	/// </summary>
+	public static string? StripAuthorTag(string? content, ulong authorId, string authorName)
+	{
+		if (content is null)
+			return null;
+		string tag = authorName.Length > 0 ? $"**{authorName}**:" : $"<@{authorId}>:";
+		if (!content.StartsWith(tag, StringComparison.Ordinal))
+			return content;
+		string rest = content[tag.Length..];
+		return rest.StartsWith('\n') ? rest[1..] : rest;
 	}
 
 	/// <summary>The subtext header a pseudo-reply carries in place of a real reply reference.</summary>
