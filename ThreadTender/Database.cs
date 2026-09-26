@@ -11,6 +11,7 @@ public record PendingOrphan(
 	string Notes,
 	string AuthorName,
 	ulong PromptMessageId,
+	ulong PromptChannelId, // where the prompt lives: a DM channel, or 0 = the managed channel (fallback)
 	DateTimeOffset ExpiresAt);
 
 /// <summary>A comment recorded as part of a top-level post's reply graph (flex mode).</summary>
@@ -42,6 +43,7 @@ public class Database : IDisposable
 				notes TEXT NOT NULL DEFAULT '',
 				author_name TEXT NOT NULL DEFAULT '',
 				prompt_message_id INTEGER NOT NULL DEFAULT 0,
+				prompt_channel_id INTEGER NOT NULL DEFAULT 0,
 				expires_at TEXT NOT NULL
 			);
 			CREATE TABLE IF NOT EXISTS transposed (
@@ -90,6 +92,10 @@ public class Database : IDisposable
 		catch (SqliteException) { /* column already exists */ }
 		try { Execute("ALTER TABLE graph_edges ADD COLUMN line_count INTEGER NOT NULL DEFAULT 0"); }
 		catch (SqliteException) { /* column already exists */ }
+
+		// DMed prompts postdate the original pending_orphans shape.
+		try { Execute("ALTER TABLE pending_orphans ADD COLUMN prompt_channel_id INTEGER NOT NULL DEFAULT 0"); }
+		catch (SqliteException) { /* column already exists */ }
 	}
 
 	private void Execute(string sql, params (string, object)[] args)
@@ -108,13 +114,14 @@ public class Database : IDisposable
 
 	public void UpsertPending(PendingOrphan p) => Execute(
 		"""
-		INSERT INTO pending_orphans (message_id, channel_id, guild_id, author_id, content, notes, author_name, prompt_message_id, expires_at)
-		VALUES ($mid, $cid, $gid, $aid, $content, $notes, $aname, $pmid, $exp)
-		ON CONFLICT(message_id) DO UPDATE SET prompt_message_id = $pmid, expires_at = $exp
+		INSERT INTO pending_orphans (message_id, channel_id, guild_id, author_id, content, notes, author_name, prompt_message_id, prompt_channel_id, expires_at)
+		VALUES ($mid, $cid, $gid, $aid, $content, $notes, $aname, $pmid, $pcid, $exp)
+		ON CONFLICT(message_id) DO UPDATE SET prompt_message_id = $pmid, prompt_channel_id = $pcid, expires_at = $exp
 		""",
 		("$mid", (long)p.MessageId), ("$cid", (long)p.ChannelId), ("$gid", (long)p.GuildId),
 		("$aid", (long)p.AuthorId), ("$content", p.Content), ("$notes", p.Notes),
-		("$aname", p.AuthorName), ("$pmid", (long)p.PromptMessageId), ("$exp", p.ExpiresAt.ToString("O")));
+		("$aname", p.AuthorName), ("$pmid", (long)p.PromptMessageId), ("$pcid", (long)p.PromptChannelId),
+		("$exp", p.ExpiresAt.ToString("O")));
 
 	public void DeletePending(ulong messageId) =>
 		Execute("DELETE FROM pending_orphans WHERE message_id = $mid", ("$mid", (long)messageId));
@@ -124,7 +131,7 @@ public class Database : IDisposable
 		lock (gate)
 		{
 			using SqliteCommand cmd = connection.CreateCommand();
-			cmd.CommandText = "SELECT message_id, channel_id, guild_id, author_id, content, notes, author_name, prompt_message_id, expires_at FROM pending_orphans";
+			cmd.CommandText = "SELECT message_id, channel_id, guild_id, author_id, content, notes, author_name, prompt_message_id, prompt_channel_id, expires_at FROM pending_orphans";
 			using SqliteDataReader reader = cmd.ExecuteReader();
 			List<PendingOrphan> result = [];
 			while (reader.Read())
@@ -132,7 +139,8 @@ public class Database : IDisposable
 				result.Add(new PendingOrphan(
 					(ulong)reader.GetInt64(0), (ulong)reader.GetInt64(1), (ulong)reader.GetInt64(2),
 					(ulong)reader.GetInt64(3), reader.GetString(4), reader.GetString(5),
-					reader.GetString(6), (ulong)reader.GetInt64(7), DateTimeOffset.Parse(reader.GetString(8))));
+					reader.GetString(6), (ulong)reader.GetInt64(7), (ulong)reader.GetInt64(8),
+					DateTimeOffset.Parse(reader.GetString(9))));
 			}
 			return result;
 		}

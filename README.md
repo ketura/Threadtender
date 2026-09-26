@@ -21,8 +21,9 @@ Every managed channel runs in one of three modes, chosen when you `/bind` it:
   oldest ancestor). An author's reply to someone else's comment is ordinary discussion:
   it's walked through, counted, and swept like anyone else's.
 - **A non-reply comment from a non-whitelisted user** is deleted and held, and the bot
-  asks (in-channel, buttons visible to everyone but usable only by the commenter) which
-  post they meant to reply to:
+  **DMs the commenter** a prompt asking which post they meant to reply to (falling back
+  to a self-cleaning in-channel prompt when their DMs are closed — usable only by them
+  either way):
   - a select menu of recent top-level posts,
   - or a button opening a modal that accepts a **message ID** (dev-mode users) or a
     **snippet of the post's text** (fuzzy-matched; ambiguous matches offer an ephemeral
@@ -156,10 +157,12 @@ State (config, SQLite DB, held attachments) lives in `./data`.
 
 ## Notes & limitations
 
-- The initial "which post did you mean?" prompt is a normal channel message (Discord
-  only allows ephemeral messages as responses to interactions); everything after the
-  first click is ephemeral or self-cleaning, and the prompt deletes itself on
-  resolution, cancel, or timeout.
+- Discord only allows ephemeral ("only you can see this") messages as responses to
+  interactions, and a message merely *arriving* is not an interaction — so the initial
+  "which post did you mean?" prompt can never be ephemeral. It goes out as a DM
+  instead, with a normal channel message as the fallback when DMs are closed;
+  everything after the first click is ephemeral or self-cleaning, and the prompt
+  deletes itself on resolution, cancel, or timeout.
 - Stickers, polls, and voice-message *presentation* can't be recreated by bots; text and
   files survive, the rest is noted as omitted.
 - Webhook reposts suppress re-pings (the original message already fired its

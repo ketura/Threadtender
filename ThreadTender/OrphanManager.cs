@@ -45,7 +45,7 @@ public class OrphanManager(BotConfig config, Database db, Transposer transposer,
 
 		// Persist BEFORE deleting — from here on, the content can always be recovered.
 		PendingOrphan pending = new(message.Id, message.ChannelId, message.Channel!.Guild.Id, author.Id,
-			content.Content, content.Notes, author.NameOverride ?? "", 0,
+			content.Content, content.Notes, author.NameOverride ?? "", 0, 0,
 			DateTimeOffset.UtcNow.AddMinutes(config.OrphanTimeoutMinutes(message.Channel!.GuildId ?? 0)));
 		db.UpsertPending(pending);
 
@@ -81,34 +81,61 @@ public class OrphanManager(BotConfig config, Database db, Transposer transposer,
 	{
 		List<DiscordMessage> candidates = await GetRecentTopLevelPostsAsync(message.Channel!, 10);
 
-		DiscordMessageBuilder prompt = new DiscordMessageBuilder()
-			.WithContent(
-				$"{AddresseeFor(pending)} — this channel keeps discussion attached to posts, so I've set your message aside for a moment. " +
-				$"**Which post were you replying to?** Pick one below, or give me a message ID / a snippet of its text. " +
-				$"You have {config.OrphanTimeoutMinutes(pending.GuildId)} minutes; after that I'll DM your text back to you so nothing is lost.");
-		if (pending.AuthorName.Length == 0)
-			prompt.WithAllowedMentions([new UserMention(pending.AuthorId)]);
-
-		if (candidates.Count > 0)
+		// Ephemeral messages only exist as interaction responses, and a message arriving
+		// isn't an interaction — so true privacy for the first prompt means a DM. The
+		// in-channel prompt survives only as the fallback (DMs closed, or a synthetic
+		// masquerade identity with no DM inbox).
+		DiscordMessageBuilder BuildPrompt(bool asDm)
 		{
-			List<DiscordSelectComponentOption> options = [];
-			foreach (DiscordMessage candidate in candidates)
+			string intro = asDm
+				? $"Your message in <#{pending.ChannelId}> was set aside — that channel keeps discussion attached to posts. "
+				: $"{AddresseeFor(pending)} — this channel keeps discussion attached to posts, so I've set your message aside for a moment. ";
+			DiscordMessageBuilder prompt = new DiscordMessageBuilder()
+				.WithContent(intro +
+					$"**Which post were you replying to?** Pick one below, or give me a message ID / a snippet of its text. " +
+					$"You have {config.OrphanTimeoutMinutes(pending.GuildId)} minutes; after that I'll send your text back to you so nothing is lost.");
+			if (!asDm && pending.AuthorName.Length == 0)
+				prompt.WithAllowedMentions([new UserMention(pending.AuthorId)]);
+
+			if (candidates.Count > 0)
 			{
-				string label = Snippet(candidate.Content, 90);
-				if (label.Length == 0)
-					label = "(no text — attachment/embed post)";
-				options.Add(new DiscordSelectComponentOption(label, candidate.Id.ToString(),
-					$"by {(candidate.Author as DiscordMember)?.DisplayName ?? candidate.Author?.Username} · {candidate.Timestamp:MMM d HH:mm}"));
+				List<DiscordSelectComponentOption> options = [];
+				foreach (DiscordMessage candidate in candidates)
+				{
+					string label = Snippet(candidate.Content, 90);
+					if (label.Length == 0)
+						label = "(no text — attachment/embed post)";
+					options.Add(new DiscordSelectComponentOption(label, candidate.Id.ToString(),
+						$"by {(candidate.Author as DiscordMember)?.DisplayName ?? candidate.Author?.Username} · {candidate.Timestamp:MMM d HH:mm}"));
+				}
+				prompt.AddActionRowComponent(new DiscordSelectComponent($"tt:sel:{message.Id}", "Recent posts…", options));
 			}
-			prompt.AddActionRowComponent(new DiscordSelectComponent($"tt:sel:{message.Id}", "Recent posts…", options));
+
+			prompt.AddActionRowComponent(
+				new DiscordButtonComponent(DiscordButtonStyle.Primary, $"tt:btn:{message.Id}", "Enter message ID or text…"),
+				new DiscordButtonComponent(DiscordButtonStyle.Secondary, $"tt:cxl:{message.Id}", "Cancel (send me my text back)"));
+			return prompt;
 		}
 
-		prompt.AddActionRowComponent(
-			new DiscordButtonComponent(DiscordButtonStyle.Primary, $"tt:btn:{message.Id}", "Enter message ID or text…"),
-			new DiscordButtonComponent(DiscordButtonStyle.Secondary, $"tt:cxl:{message.Id}", "Cancel (DM me my text)"));
+		DiscordMessage? promptMessage = null;
+		ulong promptChannelId = 0;
+		if (pending.AuthorName.Length == 0) // synthetic identities have no DM inbox
+		{
+			try
+			{
+				DiscordMember member = await message.Channel!.Guild.GetMemberAsync(pending.AuthorId);
+				promptMessage = await member.SendMessageAsync(BuildPrompt(asDm: true));
+				promptChannelId = promptMessage.ChannelId;
+			}
+			catch (Exception)
+			{
+				// DMs closed or member unreachable — fall back to the channel below.
+			}
+		}
 
-		DiscordMessage promptMessage = await message.Channel!.SendMessageAsync(prompt);
-		pending = pending with { PromptMessageId = promptMessage.Id };
+		promptMessage ??= await message.Channel!.SendMessageAsync(BuildPrompt(asDm: false));
+
+		pending = pending with { PromptMessageId = promptMessage.Id, PromptChannelId = promptChannelId };
 		db.UpsertPending(pending);
 
 		ScheduleTimeout(client, pending);
@@ -562,7 +589,9 @@ public class OrphanManager(BotConfig config, Database db, Transposer transposer,
 		{
 			try
 			{
-				DiscordChannel channel = await client.GetChannelAsync(pending.ChannelId);
+				// The prompt lives either in a DM channel (recorded) or the managed channel (fallback).
+				ulong promptChannelId = pending.PromptChannelId != 0 ? pending.PromptChannelId : pending.ChannelId;
+				DiscordChannel channel = await client.GetChannelAsync(promptChannelId);
 				DiscordMessage prompt = await channel.GetMessageAsync(pending.PromptMessageId);
 				await prompt.DeleteAsync();
 			}
